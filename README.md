@@ -1,19 +1,15 @@
-# HALE: can the Summit District's rain catchment meet the park's needs in a changing climate?
+# HALE Summit District WSVA
 
-Water Supply Vulnerability Assessment (WSVA) for the main water supply at Haleakalā National Park
-(HALE), the Summit District rain-catchment system. The report covers:
+Water Supply Vulnerability Assessment (WSVA) for the main water supply at Haleakalā National Park (HALE), the Summit District rain-catchment system. The report covers:
 
-- **Observed rain:** the park's rain gauge and the HCDP daily rain maps, including the widening
-  rain shadow.
-- **Futures:** the park's two climate futures (Hawaiʻi Regional Climate Model, RCP 4.5 and RCP 8.5,
-  2080-2099), with the model's rain corrected to observed amounts.
-- **Supply and demand:** visitation, recreation.gov reservations, and a daily tank model of the
-  system's storage.
+- **Observed rain:** the park's rain gauge and the HCDP daily rain maps, including the widening rain shadow.
+- **Futures:** the park's two climate futures (Hawaiʻi Regional Climate Model, RCP 4.5 and RCP 8.5, 2080-2099), with the model's rain corrected to observed amounts.
+- **Supply and demand:** visitation, recreation.gov reservations, and a daily tank model of the system's storage.
 - **Other threats:** water quality, wildfire and severe storms.
 
 ## Files
 
-```
+```         
 HALE_Summit_WSVA.Rmd             the report: settings, the values quoted in the text, and the text
 HALE_Summit_WSVA_Processing.Rmd  downloads, data, analysis, figures, tables and Appendix A;
                                  knit as a child of the report
@@ -24,39 +20,28 @@ hi_src/                          analysis functions for any site in Hawaiʻi
 
 ## Run it
 
-Open the project in RStudio, which supplies pandoc, and knit **`HALE_Summit_WSVA.Rmd`**. From a
-terminal, in the project folder:
+Open the project in RStudio, which supplies pandoc, and knit **`HALE_Summit_WSVA.Rmd`**. From a terminal, in the project folder:
 
 ``` bash
 Rscript -e 'rmarkdown::render("HALE_Summit_WSVA.Rmd")'
 ```
 
-**Settings and assumptions** are at the top of the report's `constants` chunk:
-- the park;
-- collection efficiency, demand and catchment area, marked `{{ASSUMPTION}}` in the text;
-- the last year of visitation;
-- `rerun_downloads`.
+**Settings and assumptions** are at the top of the report's `constants` chunk: - the park; - collection efficiency, demand and catchment area, marked `{{ASSUMPTION}}` in the text; - the last year of visitation; - `rerun_downloads`.
 
-**Downloads:**
-- **`rerun_downloads <- TRUE`:** the processing file's `proc-download` chunk downloads every
-  input into `hi_datasets/`. This takes an hour or more and is needed on a first run.
-- **`FALSE`:** the report reads the saved copies.
+**Downloads:** - **`rerun_downloads <- TRUE`:** the processing file's `proc-download` chunk downloads every input into `hi_datasets/`. This takes an hour or more and is needed on a first run. - **`FALSE`:** the report reads the saved copies.
 
 `hi_datasets/` and `data/` are git-ignored.
 
-**Not downloadable:** two inputs are read through a `data/` link to the project's shared folder:
-- the NPS Water Supply Database spreadsheet (`data/Water_Supply_Systems/`), an internal NPS file;
-- the project's archive of NPS park alerts (`data/all/nps_alerts/tidy/`).
+**Not downloadable:** two inputs are read through a `data/` link to the project's shared folder: - the NPS Water Supply Database spreadsheet (`data/Water_Supply_Systems/`), an internal NPS file; - the project's archive of NPS park alerts (`data/all/nps_alerts/tidy/`).
 
-`setup.R` installs any missing packages, including `rnoaa` from GitHub. The reservation download
-also uses the shell tools `unzip` and `grep`.
+`setup.R` installs any missing packages, including `rnoaa` from GitHub. The reservation download also uses the shell tools `unzip` and `grep`.
 
 Figures are also saved as PNGs to `data/park/HALE/Figs/`.
 
 ## `src/`: data access
 
 | Function | Data |
-|---|---|
+|------------------------------------|------------------------------------|
 | `get_wsd()` | NPS Water Supply Database |
 | `getParkBoundary()`, `getParkSystem()` | NPS park boundaries (IRMA) |
 | `get_hcdp_obs_park()` | HCDP daily rain maps, the park's 250-m cells (uses grid helpers in `get_nex_hidcp_park.R`) |
@@ -72,7 +57,7 @@ Figures are also saved as PNGs to `data/park/HALE/Figs/`.
 ## `hi_src/`: analysis
 
 | File | Functions |
-|---|---|
+|------------------------------------|------------------------------------|
 | `hi_extract.R` | `hi_site_cells()`, `hi_site_daily()`: a site's grid cells and daily rain from a parquet store |
 | `hi_isohyets.R` | `hi_wy_grid()`, `hi_wy_raster()`, `hi_compare_isohyets()`: yearly rain maps and rain-shadow movement |
 | `hi_hrcm.R` | `hi_hrcm_download()`, `hi_hrcm_download_wind()`, `hi_hrcm_daily()` and helpers: hourly rain and wind from the Hawaiʻi Regional Climate Model (Zhang 2017, USGS) |
@@ -86,7 +71,7 @@ Figures are also saved as PNGs to `data/park/HALE/Figs/`.
 Written to `hi_datasets/` by `proc-download` unless noted.
 
 | File | What | Source |
-|---|---|---|
+|------------------------|------------------------|------------------------|
 | `HALE_park_boundary.gpkg` | Park boundary | NPS IRMA |
 | `HALE_system_setting.csv` | Physical setting of each water system | Hawaiʻi Statewide GIS, NRCS, USGS |
 | `HALE/` | HCDP daily rain maps, 1990 on | Hawaiʻi Climate Data Portal |
