@@ -529,7 +529,8 @@ flow <- data.table::rbindlist(lapply(list(vc_m, use_m[2, ]), function(g)
   data.table::data.table(x = xy(cat_m)[1], y = xy(cat_m)[2], xend = xy(g)[1], yend = xy(g)[2])))
 park_m <- sf::st_transform(park_boundary, 3857)
 rain_fill <- scale_fill_gradientn("Mean annual rain,\n1991-2025 (in)", colours = c("#F3E3C3", "#C9D8A8", "#7DB8A6", "#3C8DA3", "#23557E", "#1B2F59"),
-                                  trans = "log10", breaks = c(30, 60, 120, 240), oob = scales::squish)
+                                  trans = "log10", limits = c(30, 240), breaks = c(30, 60, 120, 240),
+                                  labels = c("<30", "60", "120", ">240"), oob = scales::squish)   # rain outside 30-240 in takes the end colours
 # The map: rain, isohyets, park outline on top, the system and where its water goes, the gauges
 gx <- xy(gauge_m[grepl("Kula", gauge_m$lab), ])
 xl_a <- c(min(range(rain_df$x)[1], gx[1]) - 1500, range(rain_df$x)[2] + 1200); yl_a <- range(rain_df$y) + c(-1200, 4000)
@@ -705,16 +706,23 @@ p_sun <- ggplot(res_fy[fac == "sunrise"], aes(fy, reservations / 1000)) + geom_c
 figs$visits <- list(p = patchwork::wrap_plots(p_vis, p_hos, p_sun, ncol = 3, widths = c(1.6, 1, 1)), w = 10, h = 3.2)
 save_fig(figs$visits$p, "Summit_visitation", 10, 3.2)
 
-# ---- Figure: lowest storage reached each water year -----------------------------------------
+# ---- Figure: lowest storage reached each month ------------------------------------------------
+# low (per water year) feeds the text; the figure shows each month's lowest level, one panel per
+# run, placed along the run's years (month 1 = November, so year k spans k - 0.5 to k + 0.5)
 low <- trace[, .(low = 100 * min(storage) / summit_storage, short = sum(short)), by = .(CF, wy)][, cf := factor(cf_lab[CF], cf_lab)]
 low[, run_year := wy - min(hr_wys) + 1L]                               # year of the 19-year run
-p_store <- ggplot(low, aes(run_year, low, color = cf)) +
+low_mon <- trace[, .(low = 100 * min(storage) / summit_storage, short = sum(short)), by = .(CF, wy, month)][, cf := factor(cf_lab[CF], cf_lab)]
+low_mon[, x := wy - min(hr_wys) + 1L - 0.5 + (hi_wy_month(month) - 0.5) / 12]
+p_store <- ggplot(low_mon, aes(x, low, color = cf)) +
   geom_hline(yintercept = 0, linewidth = 0.4) +
-  geom_line(linewidth = 0.5, alpha = 0.7) + geom_point(aes(shape = short > 0), size = 1.8) +
-  scale_shape_manual(NULL, values = c(`FALSE` = 16, `TRUE` = 4), labels = c(`FALSE` = "Demand met all year", `TRUE` = "Tanks ran dry")) +
-  scale_color_manual(NULL, values = stats::setNames(cf_cols, cf_lab)) +
-  run_year_x + labs(x = NULL, y = "Lowest storage reached (% full)") + theme_cf + theme(legend.box = "vertical")
-figs$storage <- save_fig(p_store, "Summit_lowest_storage", 7.5, 4)
+  geom_line(linewidth = 0.4, alpha = 0.7) +
+  geom_point(aes(shape = short > 0, size = short > 0)) +
+  facet_wrap(~cf, ncol = 1) +
+  scale_shape_manual(NULL, values = c(`FALSE` = 16, `TRUE` = 4), labels = c(`FALSE` = "Demand met all month", `TRUE` = "Tanks ran dry")) +
+  scale_size_manual(NULL, values = c(`FALSE` = 0.6, `TRUE` = 1.8), labels = c(`FALSE` = "Demand met all month", `TRUE` = "Tanks ran dry")) +
+  scale_color_manual(NULL, values = stats::setNames(cf_cols, cf_lab), guide = "none") +
+  run_year_x + labs(x = NULL, y = "Lowest storage reached in the month (% full)") + theme_cf
+figs$storage <- save_fig(p_store, "Summit_lowest_storage", 7.5, 6.5)
 
 lab_all <- c(cf_lab, observed = "Observed rain, same years (check)")
 need_plot <- need[CF %in% names(lab_all) & !is.na(acres_100)][, cfl := factor(lab_all[CF], lab_all)]
