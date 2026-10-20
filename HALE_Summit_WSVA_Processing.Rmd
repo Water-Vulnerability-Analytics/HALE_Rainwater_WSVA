@@ -1,0 +1,823 @@
+<!--
+Child document of HALE_Summit_WSVA.Rmd. It holds all data compilation, analysis and
+figures for the Summit District report, and renders the appendix (methods, strengths,
+weaknesses, code). HALE_Summit_WSVA.Rmd knits it first (knitr::knit_child) so the main
+text can use its results, then prints it at the end. Reusable steps are functions in
+hi_src/ (any Hawaiʻi site); data access uses src/. Data are cached under hi_datasets/.
+-->
+
+```{r settings-copy, eval = FALSE, include = FALSE}
+source("setup.R")
+# SETTINGS AND ASSUMPTIONS
+park <- "HALE"
+C_eff <- 0.8               # {{ASSUMPTION}} share of rain on the catchment that reaches the tanks
+dem_gpd <- 5000            # {{ASSUMPTION}} constant demand, gallons per day (no metered data)
+catchment_acres <- NA      # {{ASSUMPTION}} NA = just large enough for dem_gpd in the present-day run
+demand_end <- 2025         # last calendar year of visitation data
+rerun_downloads <- FALSE   # TRUE: re-download every input (an hour or more); FALSE: read saved copies
+wet_months <- c(11L, 12L, 1:4)                 # Hawaiʻi wet season, Nov-Apr
+days_in_month <- c(31, 28.25, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+gal_per_liter <- 0.264172
+m2_per_acre <- 4046.856
+options(hi.fig_dir = file.path("data", "park", park, "Figs"))
+theme_cf <- theme_bw(base_size = 9) +
+  theme(strip.background = element_rect(fill = "gray95"), strip.text = element_text(colour = "black", face = "bold"),
+        legend.position = "bottom")
+fig_ids <- c("map", "trend", "shadow", "hrcm", "hrcm_ts", "monthly", "visits", "storage", "need", "storms")
+tab_ids <- c("bluf", "trend", "hrcm")
+fref <- function(id) paste("Figure", match(id, fig_ids))
+tref <- function(id) paste("Table", match(id, tab_ids))
+fcap <- function(id, text) paste0(fref(id), ": ", text)
+tcap <- function(id, text) paste0(tref(id), ": ", text)
+assume <- function(x) paste0("{{ASSUMPTION: ", x, "}}")
+figs <- list(); tabs <- list()
+```
+
+
+```{r proc-download, include = FALSE}
+# ---- Inputs: where every file this script reads comes from ---------------------------------
+# With rerun_downloads <- TRUE (set in the report's settings) this chunk re-downloads every
+# external input and overwrites the saved copies; it takes an hour or more. With FALSE (the
+# usual case) nothing is downloaded and the later chunks read the saved copies below.
+# Not downloadable: the NPS Water Supply Database (data/Water_Supply_Systems/
+# NPS_Water_Systems_Database_Joined.xlsx), an internal NPS file read by get_wsd(), and the
+# project's archive of NPS park alerts (data/all/nps_alerts/tidy/, daily snapshots of every
+# park's posted alerts, 2019 on).
+# rerun_downloads <- TRUE
+f_boundary <- file.path("hi_datasets", paste0(park, "_park_boundary.gpkg"))       # NPS park boundary
+f_setting <- file.path("hi_datasets", paste0(park, "_system_setting.csv"))        # each system's physical setting
+ridb_dir <- file.path("data", "park", park, "RIDBFullExport_V1_CSV")              # recreation.gov facilities and campsites
+nex_dir <- file.path("hi_datasets", park)                                         # HCDP daily rain maps (observed)
+f_stations <- file.path("hi_datasets", paste0(park, "_ghcnd_stations.gpkg"))      # GHCN-Daily rain gauges near the park
+f_gauge_prcp <- file.path("hi_datasets", paste0(park, "_ghcnd_prcp.parquet"))     # their daily rain
+hrcm_dir <- file.path("hi_datasets", paste0(park, "_hrcm"))                       # regional climate model, hourly rain
+f_visits <- file.path("hi_datasets", paste0(park, "_visitation_monthly.parquet")) # NPS visitor statistics
+f_res <- file.path("hi_datasets", paste0(park, "_ridb_reservations.parquet"))     # recreation.gov reservations
+f_oni <- file.path("hi_datasets", "noaa_oni.txt")                                 # Oceanic Niño Index (El Niño / La Niña)
+f_pdo <- file.path("hi_datasets", "noaa_pdo.txt")                                 # Pacific Decadal Oscillation index
+f_storm <- file.path("hi_datasets", "HI_storm_events.parquet")                   # NOAA Storm Events, Hawaiʻi
+f_alerts <- file.path("hi_datasets", paste0(park, "_nws_alerts_HIZ022.parquet")) # NWS alerts, Haleakalā summit zone
+park_alerts_dir <- file.path("data", "all", "nps_alerts", "tidy")              # NPS park alerts (project archive)
+# What to fetch
+gauge_use <- c(USC00511004 = "Summit District gauge", USC00515000 = "Kula gauge")   # Haleakalā Ranger Station; Kula Branch Station
+hr_runs <- c(present = "maui_present", cf1 = "maui_rcp45", cf2 = "maui_rcp85")
+res_ids <- c(hosmer = "10068557", sunrise = "253731")      # Hosmer Grove Campground; summit sunrise
+res_years <- 2017:2025                                     # fiscal years of reservation files
+# Reads a GeoPackage with its geometry column named "geometry"
+read_gpkg <- function(f) { x <- sf::st_read(f, quiet = TRUE); sf::st_geometry(x) <- "geometry"; x }
+
+if (rerun_downloads) {
+  old_timeout <- options(timeout = 3600)                   # allow large files
+  pts_dl <- get_wsd(conus = FALSE) %>% dplyr::filter(park_unit == park) %>%
+    dplyr::distinct(wsd_system_id, .keep_all = TRUE) %>% sf::st_transform(4326)
+  # Park boundary (NPS IRMA)
+  bnd <- getParkBoundary(park = park)
+  sf::st_write(bnd, f_boundary, delete_dsn = TRUE, quiet = TRUE)
+  # Physical setting of each water system (Hawaiʻi Statewide GIS layers + USGS elevation)
+  unlink(f_setting)
+  hi_site_setting(pts_dl, "wsd_system_id", cache = f_setting)
+  # recreation.gov facility and campsite tables (RIDB full export, ~250 MB zip)
+  zip <- tempfile(fileext = ".zip")
+  utils::download.file("https://ridb.recreation.gov/downloads/RIDBFullExport_V1_CSV.zip", zip, mode = "wb", quiet = TRUE)
+  utils::unzip(zip, exdir = ridb_dir, junkpaths = TRUE, overwrite = TRUE); unlink(zip)
+  # HCDP daily rain maps, every year from 1990 to yesterday, the park's 250-m cells only
+  get_hcdp_obs_park(park = park, output_dir = nex_dir, park_boundary = bnd,
+                    years = 1990:as.integer(format(Sys.Date(), "%Y")), overwrite = TRUE)
+  # GHCN-Daily rain gauges within 10 km of the park, and the daily rain of the two used here
+  # (rnoaa::meteo_pull_monitors() returns tenths of a mm)
+  st <- get_ghcnd_near_park(bnd, buffer_km = 10, element = "PRCP")
+  sf::st_write(st, f_stations, delete_dsn = TRUE, quiet = TRUE)
+  rnoaa::meteo_pull_monitors(names(gauge_use), var = "PRCP", date_min = "1950-01-01", date_max = as.character(Sys.Date())) %>%
+    dplyr::mutate(prcp_mm = prcp / 10) %>% dplyr::select(id, date, prcp_mm) %>%
+    dplyr::left_join(sf::st_drop_geometry(st) %>% dplyr::select(id, name, elevation), by = "id") %>%
+    arrow::write_parquet(f_gauge_prcp)
+  # Regional climate model: hourly rain for the 3 x 3 cells around each system, three runs
+  hi_hrcm_download(pts_dl, hrcm_dir, runs = unname(hr_runs), id_col = "wsd_system_id", n = 3, overwrite = TRUE)
+  # ... and hourly 10-m wind for the Summit District's 9 cells only
+  hi_hrcm_download_wind(data.table::fread(file.path(hrcm_dir, "_cells.csv"))[wsd_system_id == "HALE_WS_001"], hrcm_dir,
+                        runs = unname(hr_runs), overwrite = TRUE)
+  # NPS visitor statistics (IRMA), monthly, 1979 on
+  arrow::write_parquet(getUnitVisitation(units = park, startYear = 1979, endYear = demand_end, allStats = TRUE), f_visits)
+  # recreation.gov reservations for the two facilities (yearly national files, 0.1-0.5 GB each)
+  get_ridb_reservations(res_years, res_ids, raw_dir = file.path("hi_datasets", "ridb_reservations_raw"),
+                        out_file = f_res, overwrite = TRUE)
+  # El Niño / La Niña (NOAA CPC Oceanic Niño Index) and the Pacific Decadal Oscillation (NOAA NCEI)
+  utils::download.file("https://www.cpc.ncep.noaa.gov/data/indices/oni.ascii.txt", f_oni, quiet = TRUE)
+  utils::download.file("https://www.ncei.noaa.gov/pub/data/cmb/ersst/v5/index/ersst.v5.pdo.dat", f_pdo, quiet = TRUE)
+  # Past storms: NOAA Storm Events for Hawaiʻi (1996 on) and NWS alerts for the Haleakalā summit zone
+  get_storm_events("HAWAII", 1996:as.integer(format(Sys.Date(), "%Y")), out_file = f_storm, overwrite = TRUE)
+  arrow::write_parquet(get_nws_alerts("HIZ022"), f_alerts)
+  options(old_timeout)
+  # The NPS Park Tiles basemaps are re-downloaded by tiles_for() in proc-figures.
+}
+```
+
+```{r proc-systems, include = FALSE}
+wsd <- get_wsd(conus = FALSE) %>% dplyr::filter(park_unit == park)
+# One point per water system (the source id's are duplicated coordinates, and we care only about rain)
+pts_all <- wsd %>% dplyr::distinct(wsd_system_id, .keep_all = TRUE) %>% sf::st_transform(4326)
+sys_lab <- c(HALE_WS_001 = "Summit District", HALE_WS_002 = "Kīpahulu", HALE_WS_003 = "Kapalaoa cabin",
+             HALE_WS_004 = "Palikū cabins", HALE_WS_005 = "Hōlua cabins", HALE_WS_006 = "Haleakalā Visitor Center (UT-21)")
+pts_all$label <- sys_lab[pts_all$wsd_system_id]
+summit_pt <- pts_all %>% dplyr::filter(wsd_system_id == "HALE_WS_001") %>% dplyr::mutate(system = "Summit District")
+wv <- function(id, col) unique(sf::st_drop_geometry(wsd)[wsd$wsd_system_id == id, col])   # one WSD field for one system
+summit_storage <- as.numeric(wv("HALE_WS_001", "storage_capacity_gallons"))
+# Each system's physical setting (geology, soil, aquifer, watershed, moisture zone, land cover,
+# elevation), looked up from statewide GIS layers by hi_site_setting() in proc-download
+setting <- as.data.frame(readr::read_csv(f_setting, show_col_types = FALSE))
+# sset(id, col): look up one setting value for one water system, e.g.
+# sset("HALE_WS_001", "elev_ft") -> the Summit District catchment's elevation (ft).
+# `setting` has one row per WSD system (geology, soil, watershed, moisture zone, land cover,
+# elevation); [1] returns a single value even if a system appears twice.
+sset <- function(id, col) setting[setting$wsd_system_id == id, col][1]
+park_boundary <- read_gpkg(f_boundary)                                 # NPS park boundary polygon
+
+# Visitor centers and Hosmer Grove campground capacity (recreation.gov RIDB export).
+# hi_ridb_capacity(): reads the RIDB facility and campsite tables for the park's recreation area;
+# returns facilities (`fac`, with coordinates) and sites/people per night by place (`cap_place`).
+ridb <- hi_ridb_capacity(ridb_dir, anchor_facility = "Hosmer Grove",
+                         places = c(Hosmer = "Hosmer Grove"))
+vc <- ridb$fac[grepl("Haleakal.* Visitor Center", FacilityName) & !grepl("Headquarters", FacilityName)][1]
+hq_vc <- ridb$fac[grepl("Headquarters Visitor Center", FacilityName)][1]
+hosmer_cap <- ridb$cap_place[place == "Hosmer Grove"]
+```
+
+```{r proc-observed, include = FALSE}
+# ---- Observed rain: HCDP daily rain maps, 250-m grid (Longman et al. 2019) ----------------
+# Reads (does not download) every day of observed rain saved in the local data store
+# (hi_datasets/HALE/, written by get_hcdp_obs_park() in proc-download): daily grids as parquet
+# files, partitioned by variable/scenario/model, plus _cells.parquet listing each grid cell's
+# location and how much of it lies in the park. Currently January 1990 through the latest
+# download. No year filter is applied here; later steps keep only complete Hawaiʻi water years
+# (Nov-Oct), 1991-2025.
+nex_cells <- arrow::read_parquet(file.path(nex_dir, "_cells.parquet"))
+nex <- arrow::open_dataset(nex_dir)
+# hi_site_cells(): the grid cell containing the system plus its neighbors (n = 3 -> a 3 x 3 block,
+# ~750 m across), so one odd cell does not dominate
+sc <- hi_site_cells(summit_pt, nex_cells, id_col = "system", n = 3)
+# hi_site_daily(): reads those cells from the store and averages them into one daily rain series (mm)
+obs <- hi_site_daily(nex %>% dplyr::filter(variable == "pr", scenario == "observed", cell_id %in% !!sc$cell_id), sc)
+data.table::setorder(obs, date)
+# hi_water_year(): Hawaiʻi water year, Nov-Oct, named for the year it ends (Nov 2024 -> 2025)
+obs[, `:=`(wy = hi_water_year(year, month), season = data.table::fifelse(month %in% wet_months, "wet", "dry"))]
+obs_last <- max(obs[!is.na(pr)]$date)
+obs_na_days <- obs[is.na(pr)]$date                                    # missing at the source
+base_wy <- obs[, .(n = .N, n_m = data.table::uniqueN(month)), by = wy][n >= 365 & n_m == 12]$wy   # complete water years only
+base <- obs[wy %in% base_wy]                                           # complete water years (a day missing at the source stays NA)
+
+# Park outline on the 250-m grid (cells at least half inside the park), and mean annual rain for the maps
+cov_r <- terra::rast(as.data.frame(nex_cells[, c("lon", "lat", "coverage_fraction")]), type = "xyz", crs = "EPSG:4326")
+cov_r[cov_r < 0.5] <- NA; cov_r[!is.na(cov_r)] <- 1
+park_poly <- sf::st_as_sf(terra::as.polygons(cov_r))
+# hi_wy_grid(): total rain in every grid cell for every water year (one row per cell and year)
+obs_wy <- hi_wy_grid(nex %>% dplyr::filter(variable == "pr", scenario == "observed"))
+obs_wy[n_na > 0, mm := mm * n / (n - n_na)]                              # scale years with missing days to a full year
+iso_wy <- sort(obs_wy[, .(n = max(n)), by = wy][n >= 365]$wy)
+# hi_wy_raster(): turns those totals into a map (raster) of mean annual rain over the chosen years
+mean_r <- hi_wy_raster(obs_wy, nex_cells, iso_wy)
+names(mean_r) <- "pr_mm"
+# Mean annual rain; a year with a missing day is scaled up by its share of days observed (as for the gauges)
+summit_mean_in <- mean(base[, .(mm = sum(pr, na.rm = TRUE) / mean(!is.na(pr))), by = wy]$mm) / 25.4
+
+# ---- Has the rain-shadow line moved? (2,000-mm isohyet by 5-year period; area by water year) ----
+iso_per <- data.table::data.table(p0 = seq(1991L, 2021L, by = 5L))[, p1 := pmin(p0 + 4L, max(iso_wy))]
+stopifnot(all(unlist(Map(`:`, iso_per$p0, iso_per$p1)) %in% iso_wy))
+iso_per[, lab := paste0(p0, "-", p1)]
+n_per <- nrow(iso_per)
+iso_r <- lapply(seq_len(n_per), function(i) hi_wy_raster(obs_wy, nex_cells, iso_per$p0[i]:iso_per$p1[i]))   # one rain map per period
+# isohyet_line(): traces the contour where rain equals threshold_mm (here the 2,000-mm "rain-shadow
+# line") and keeps its longest piece
+iso_lines <- do.call(rbind, lapply(seq_len(n_per), function(i)
+  dplyr::mutate(isohyet_line(iso_r[[i]], threshold_mm = 2000, source = iso_per$lab[i]), period = iso_per$lab[i])))
+iso_lines$period <- factor(iso_lines$period, iso_per$lab)
+# hi_compare_isohyets(): compares the first and last period's maps and lines (cell-by-cell change,
+# distance the line moved)
+iso_cmp <- hi_compare_isohyets(iso_r[[n_per]], iso_r[[1]], iso_lines[n_per, ], iso_lines[1, ], threshold_mm = 2000)
+# Area of each grid cell (km²), to add up the area above a rain threshold
+cell_km2 <- data.table::data.table(cell_id = nex_cells$cell_id,
+                                   km2 = terra::extract(terra::cellSize(iso_r[[1]], unit = "km"), as.matrix(nex_cells[, c("lon", "lat")]))[[1]])
+# Park area (km²) receiving at least `thr` mm of rain, for each water year
+iso_area_at <- function(thr) data.table::setorder(merge(obs_wy[wy %in% iso_wy], cell_km2, by = "cell_id")[, .(km2 = sum(km2[mm >= thr])), by = wy], wy)
+iso_area <- iso_area_at(2000)                                          # sorted: trend tests need time order
+# Trend in that area: Sen's slope (the median of all year-to-year slopes, robust to outliers;
+# x10 = per decade) and the Mann-Kendall test (does the series tend to rise or fall?)
+iso_trend <- list(sen = 10 * unname(trend::sens.slope(iso_area$km2)$estimates), p = trend::mk.test(iso_area$km2)$p.value,
+                  first = mean(iso_area[wy %in% iso_per$p0[1]:iso_per$p1[1]]$km2),
+                  last = mean(iso_area[wy %in% iso_per$p0[n_per]:iso_per$p1[n_per]]$km2))
+grid_km2 <- sum(cell_km2$km2)
+# The 2,000-mm line for every single water year (for the figure)
+iso_lines_wy <- do.call(rbind, lapply(iso_wy, function(y) {
+  l <- tryCatch(isohyet_line(hi_wy_raster(obs_wy, nex_cells, y), threshold_mm = 2000, source = as.character(y)), error = function(e) NULL)
+  if (is.null(l) || !nrow(l)) NULL else dplyr::mutate(l[, "geometry"], wy = y) }))
+
+# ---- El Niño / La Niña and the Pacific Decadal Oscillation, by Hawaiʻi water year ----------
+# ENSO: the Oceanic Niño Index for the winter (Dec-Feb) inside the water year; El Niño at
+# >= +0.5 °C, La Niña at <= -0.5 °C, otherwise neutral (NOAA CPC thresholds). PDO: the mean of
+# the monthly PDO index over the water year (Nov-Oct); positive or negative phase.
+oni <- data.table::fread(f_oni)[SEAS == "DJF", .(wy = YR, oni = ANOM)]
+oni[, enso := data.table::fcase(oni >= 0.5, "El Niño", oni <= -0.5, "La Niña", default = "Neutral")]
+pdo <- data.table::fread(f_pdo, skip = 1, header = TRUE)
+pdo <- data.table::melt(pdo, id.vars = "Year", variable.name = "mon", value.name = "pdo")[pdo < 90]
+pdo[, month := match(as.character(mon), month.abb)][, wy := hi_water_year(Year, month)]
+pdo <- pdo[, .(pdo = mean(pdo), n = .N), by = wy][n == 12][, phase := ifelse(pdo >= 0, "Positive PDO", "Negative PDO")]
+climate_wy <- merge(oni, pdo[, .(wy, pdo, phase)], by = "wy", all = TRUE)
+# Rain-shadow area by ENSO phase (water years with both)
+iso_enso <- merge(iso_area, climate_wy, by = "wy")[, .(km2 = mean(km2), n = .N), by = enso]
+
+# Sensitivity: the same trend test for the areas above 1,000 and 3,000 mm
+iso_sens <- data.table::rbindlist(lapply(c(1000, 2000, 3000), function(thr) { a <- iso_area_at(thr)
+  data.table::data.table(mm = thr, sen = 10 * unname(trend::sens.slope(a$km2)$estimates), p = trend::mk.test(a$km2)$p.value) }))
+```
+
+```{r proc-gauges, include = FALSE}
+# ---- Rain gauges: the Summit District's own gauge and the nearest long leeward record ----
+# NOAA GHCN-Daily (Menne et al. 2012), from proc-download: the gauges within 10 km of the park
+# (get_ghcnd_near_park(): location, elevation, years of record) and the daily rain of the two
+# used here (gauge_use, set in proc-download)
+gauges <- read_gpkg(f_stations)
+gauge_prcp <- data.table::as.data.table(arrow::read_parquet(f_gauge_prcp))
+gauge_meta <- data.table::as.data.table(sf::st_drop_geometry(gauges))[id %in% names(gauge_use)]
+# calc_precip_indices(): per site and water year, annual/wet-season/dry-season totals, rain days
+# (>= 1 mm), heavy days (>= 25.4 mm), longest dry spells, wettest days. A year counts only when
+# at least 90% of its days were observed (min_complete). Totals and day counts are scaled up by
+# the share of days observed (scale_missing), so years with more gaps do not look drier.
+gi <- gauge_prcp[id %in% names(gauge_use), .(site = gauge_use[id], date, prcp_mm)] %>%
+  calc_precip_indices(wet_day_mm = 1, heavy_day_mm = 25.4, min_complete = 0.9, scale_missing = TRUE) %>% data.table::as.data.table()
+hcdp_i <- obs[, .(site = "HCDP map, Summit District", date, prcp_mm = pr)] %>%
+  calc_precip_indices(wet_day_mm = 1, heavy_day_mm = 25.4, min_complete = 0.9, scale_missing = TRUE) %>% data.table::as.data.table()
+hcdp_i <- hcdp_i[water_year %in% base_wy]
+rs_lab <- gauge_use[["USC00511004"]]
+rs <- gi[site == rs_lab]
+idx <- c(annual_mm = "Annual rain", wet_season_mm = "Wet-season rain (Nov-Apr)", dry_season_mm = "Dry-season rain (May-Oct)",
+         wet_days = "Rain days (≥ 0.04 in)", cdd_dry_season = "Longest dry-season dry spell", heavy_days = "Heavy-rain days (≥ 1 in)")
+# Sen's slope (per decade) and Mann-Kendall p-value for each measure in `idx`, for one record
+trend_of <- function(d, site_lab) data.table::rbindlist(lapply(names(idx), function(v) {
+  y <- d[order(water_year)][[v]]
+  data.table::data.table(site = site_lab, index = v, years = paste(min(d$water_year), max(d$water_year), sep = "-"), n = length(y),
+                         sen = 10 * unname(trend::sens.slope(y)$estimates), p = trend::mk.test(y)$p.value, mean = mean(y))
+}))
+g_trend <- rbind(trend_of(rs, rs_lab), trend_of(gi[site == gauge_use[["USC00515000"]]], gauge_use[["USC00515000"]]),
+                 trend_of(hcdp_i, "HCDP map, Summit District"))
+g_trend[, pct_dec := 100 * sen / mean]
+# Check: the Summit District gauge's rain-day trend using only years with at most 3 missing days
+rs_strict <- trend_of(rs[n_missing <= 3], rs_lab)[index == "wet_days"][, pct_dec := 100 * sen / mean]
+# ... and with missing days counted as dry (no scaling), for comparison
+rs_noscale <- trend_of(data.table::as.data.table(calc_precip_indices(gauge_prcp[id == "USC00511004", .(site = rs_lab, date, prcp_mm)],
+                         wet_day_mm = 1, heavy_day_mm = 25.4, min_complete = 0.9)), rs_lab)[index == "wet_days"][, pct_dec := 100 * sen / mean]
+# Gauge vs. HCDP map at the Summit, overlapping complete water years
+ov <- merge(rs[, .(water_year, g = annual_mm)], hcdp_i[, .(water_year, h = annual_mm)], by = "water_year")
+ov_r <- stats::cor(ov$g, ov$h)
+# Timing: mean monthly rain at the gauge, first vs. second 30 years of its complete record
+rs_m <- gauge_prcp[id == "USC00511004" & !is.na(prcp_mm)][, `:=`(wy = hi_water_year(as.integer(format(date, "%Y")), as.integer(format(date, "%m"))),
+                                                               month = as.integer(format(date, "%m")))][wy %in% rs$water_year]
+rs_split <- stats::median(rs$water_year)
+rs_mon <- rs_m[, .(mm = mean(prcp_mm) * days_in_month[month[1]]), by = .(half = ifelse(wy <= rs_split, "early", "late"), month)]
+rs_halves <- c(early = paste(min(rs$water_year), floor(rs_split), sep = "-"), late = paste(floor(rs_split) + 1, max(rs$water_year), sep = "-"))
+```
+
+```{r proc-hrcm, include = FALSE}
+# ---- Hawaiʻi Regional Climate Model (Zhang 2017): present-day and late-century runs ------
+# Hourly rain for the 3 x 3 cells (0.8 km) around each WSD point, one parquet per run, saved by
+# hi_hrcm_download() in proc-download (runs listed in hr_runs there); _cells.csv lists each
+# system's cells. Keep the Summit District's 9 cells.
+hr_cells <- data.table::fread(file.path(hrcm_dir, "_cells.csv"))[wsd_system_id == "HALE_WS_001"]
+# Hourly rain at the Summit District: the mean of its 9 cells, for each run
+hr_hourly <- data.table::rbindlist(lapply(names(hr_runs), function(r) {
+  x <- data.table::as.data.table(arrow::read_parquet(file.path(hrcm_dir, paste0(hr_runs[[r]], ".parquet"))))
+  merge(hr_cells[, .(we, sn)], x, by = c("we", "sn"))[, .(rain_mm = mean(rain_mm)), by = time_utc][, run := r]
+}))
+# hi_hrcm_daily(): sums hourly rain into Hawaiʻi Standard Time days; drops days missing any hour
+hr_daily <- hr_hourly[, hi_hrcm_daily(.SD[, .(system = "Summit District", time_utc, rain_mm)], "system"), by = run]
+hr_wys <- 1991:2009                                                   # complete water years in the runs
+# Every day of those water years; days with missing hours in the source count as dry (the
+# tank model needs every day)
+hr_days <- seq(as.Date(paste0(min(hr_wys) - 1, "-11-01")), as.Date(paste0(max(hr_wys), "-10-31")), by = "day")
+hr_daily <- merge(data.table::CJ(run = names(hr_runs), date = hr_days), hr_daily[, .(run, date, pr)], by = c("run", "date"), all.x = TRUE)
+# Days missing some hours (a gap in the source, or the hour a run's running total restarts) are
+# filled from their valid hours, scaled to 24 hours (hours assigned to days as in hi_hrcm_daily())
+hr_part <- hr_hourly[, .(run, date = as.Date(time_utc - 3600 - 10 * 3600, tz = "UTC"), rain_mm)][
+  , .(n_valid = sum(!is.na(rain_mm)), mm = sum(rain_mm, na.rm = TRUE)), by = .(run, date)]
+hr_miss <- merge(hr_daily[is.na(pr), .(run, date)], hr_part, by = c("run", "date"), all.x = TRUE)[, pr_fill := mm * 24 / n_valid]
+stopifnot(all(hr_miss$n_valid >= 6))                                   # at least a quarter of the day observed
+hr_daily[hr_miss, on = .(run, date), pr := i.pr_fill]
+# fdate(): "March 15, 1999"-style dates for the appendix text
+fdate <- function(d) paste0(month.name[as.integer(format(d, "%m"))], " ", as.integer(format(d, "%d")), ", ", format(d, "%Y"))
+hr_miss_txt <- hr_miss[, .(d = paste0(fdate(date), " (", n_valid, " of 24 hours)", collapse = " and ")), by = run][
+  , paste0(d, " in the ", c(present = "present-day run", cf1 = "Climate Future 1 run", cf2 = "Climate Future 2 run")[run], collapse = "; ")]
+hr_daily[, month := as.integer(format(date, "%m"))]
+hr_daily[, `:=`(wy = hi_water_year(as.integer(format(date, "%Y")), month), wet = month %in% wet_months)]
+
+# ---- Correct the model's rain amounts: one factor per season (wet Nov-Apr, dry May-Oct), set so
+# the present-day run's mean rain equals observed rain at the same place over the same water
+# years; the same factors apply to both futures. The model's own sequence of rain and dry days,
+# and its changes in them, are kept.
+stopifnot(!anyNA(obs[wy %in% hr_wys]$pr))                              # no missing days in 1991-2009
+obs_hr <- obs[wy %in% hr_wys, .(date, pr, wy, month, wet = month %in% wet_months)]
+data.table::setorder(obs_hr, date)
+stopifnot(length(obs_hr$date) == length(hr_days), all(as.numeric(obs_hr$date) == as.numeric(hr_days)))
+hr_k <- merge(obs_hr[, .(obs = mean(pr)), by = wet], hr_daily[run == "present", .(model = mean(pr)), by = wet], by = "wet")[, k := obs / model]
+hr_daily[, pr_raw := pr][, pr := pr_raw * hr_k$k[match(wet, hr_k$wet)]]
+data.table::setorder(hr_daily, run, date)
+
+# Per water year, the measures that matter for a catchment (rain in mm; a rain day is >= 1 mm).
+# hi_longest_run(): length of the longest unbroken run of TRUE values (e.g. dry days in a row).
+wy_stats <- function(d) d[wy %in% hr_wys][order(date)][, .(
+  ann = sum(pr), wet_mm = sum(pr[wet]), dry_mm = sum(pr[!wet]),
+  dry_days = sum(pr < 1), cdd = hi_longest_run(pr < 1), cdd_dry = hi_longest_run(pr[!wet] < 1),
+  rain_days = sum(pr >= 1), sdii = mean(pr[pr >= 1]), heavy = sum(pr >= 25.4),
+  cwd = hi_longest_run(pr >= 1), wet_spell = { r <- rle(pr >= 1); mean(r$lengths[r$values]) },
+  rx1 = max(pr), rx3 = max(data.table::frollsum(pr, 3), na.rm = TRUE)), by = wy]
+# Largest single-hour rain in each water year, corrected with the same seasonal factors
+hr_hmax <- hr_hourly[!is.na(rain_mm)][, month := as.integer(format(time_utc - 10 * 3600, "%m"))][
+  , `:=`(wy = hi_water_year(as.integer(format(time_utc - 10 * 3600, "%Y")), month),
+         rain_mm = rain_mm * hr_k$k[match(month %in% wet_months, hr_k$wet)])][
+  wy %in% hr_wys, .(hmax = max(rain_mm)), by = .(run, wy)]
+hr_wy <- merge(hr_daily[, wy_stats(.SD), by = run], hr_hmax, by = c("run", "wy"))
+hr_meas <- c(ann = "Annual rain", wet_mm = "Wet-season rain (Nov-Apr)", dry_mm = "Dry-season rain (May-Oct)",
+             dry_days = "Dry days (< 0.04 in)", cdd = "Longest dry spell", cdd_dry = "Longest dry-season dry spell",
+             rain_days = "Rain days (≥ 0.04 in)", sdii = "Rain per rain day", heavy = "Heavy-rain days (≥ 1 in)",
+             wet_spell = "Average wet spell", cwd = "Longest wet spell", rx1 = "Wettest day", rx3 = "Wettest 3 days",
+             hmax = "Largest hourly rain")
+# Dry spells long enough to matter for wildfire: grasses become flammable after 14 days without rain
+# and can carry large fires after 30 (NPS, 2024); counted within each Hawaiʻi water year
+fire_dry <- hr_daily[wy %in% hr_wys][order(run, date)][, { r <- rle(pr < 1); L <- r$lengths[r$values]
+  .(n14 = sum(L >= 14), any30 = any(L >= 30)) }, by = .(run, wy)][, .(n14 = mean(n14), p30 = 100 * mean(any30)), by = run]
+# Change in each future vs. the present-day run (corrected rain); paired t-test across the same weather years
+hr_chg <- data.table::rbindlist(lapply(c("cf1", "cf2"), function(f) data.table::rbindlist(lapply(names(hr_meas), function(m) {
+  a <- hr_wy[run == "present"][order(wy)][[m]]; b <- hr_wy[run == f][order(wy)][[m]]
+  data.table::data.table(cf = f, m = m, present = mean(a), future = mean(b), pct = 100 * (mean(b) / mean(a) - 1),
+                         p = stats::t.test(b, a, paired = TRUE)$p.value)
+}))))
+# How the present-day run compares with observed rain at the same place, 1991-2009, before
+# (ratio_raw) and after (ratio) the correction
+# Average of each yearly measure over the years, as a long table (one row per measure)
+avg <- function(d, lab) data.table::melt(wy_stats(d)[, lapply(.SD, mean), .SDcols = setdiff(names(hr_meas), "hmax")],
+                                         measure.vars = setdiff(names(hr_meas), "hmax"), variable.name = "m", value.name = lab)
+hr_bias <- Reduce(function(a, b) merge(a, b, by = "m"),
+                  list(avg(obs_hr, "obs"), avg(hr_daily[run == "present", .(date, pr = pr_raw, wy, wet)], "raw"), avg(hr_daily[run == "present"], "cor")))
+hr_bias[, `:=`(m = as.character(m), ratio_raw = raw / obs, ratio = cor / obs)]
+# How closely the present-day run's weather follows the real weather: day by day, water year by
+# water year, and the driest three water years in a row (mm)
+hr_vs_obs <- merge(obs_hr[, .(date, wy, obs = pr)], hr_daily[run == "present", .(date, model = pr)], by = "date")
+hr_skill <- hr_vs_obs[, .(obs = sum(obs), model = sum(model)), by = wy][order(wy)][
+  , .(r_day = hr_vs_obs[, stats::cor(obs, model)], r_wy = stats::cor(obs, model),
+      min3_obs = min(data.table::frollsum(obs, 3), na.rm = TRUE), min3_model = min(data.table::frollsum(model, 3), na.rm = TRUE))]
+# Mean monthly rain, observed and in each run; each future's change in each month
+hr_mon <- rbind(obs_hr[, .(run = "observed", r = mean(pr)), by = month], hr_daily[, .(r = mean(pr)), by = .(run, month)])[, mm := r * days_in_month[month]]
+mon_fac <- merge(hr_mon[run %in% c("cf1", "cf2")], hr_mon[run == "present", .(month, r0 = r)], by = "month")[, fac := r / r0]
+```
+
+```{r proc-futures, include = FALSE}
+# ---- Rain for the tank model: the corrected runs themselves, day by day --------------------
+cf_lab <- c(present = paste0("Present-day run (", min(hr_wys), "-", max(hr_wys), ")"),
+            cf1 = "Climate Future 1 (RCP 4.5)", cf2 = "Climate Future 2 (RCP 8.5)")
+cf_cols <- c(present = "#7f7f7f", cf1 = "#9A9EE5", cf2 = "#E10720")    # colours of the NPS climate-futures scripts (NPS_HI_Climate_Data/)
+# Daily rain matrix for the tank model: one column per run, one row per day
+P <- sapply(names(cf_lab), function(r) hr_daily[run == r]$pr)
+# Checks of the correction (appendix): observed rain on the same days, and a month-by-month
+# correction in place of the seasonal one
+hr_k_mon <- merge(obs_hr[, .(obs = mean(pr)), by = month], hr_daily[run == "present", .(model = mean(pr_raw)), by = month], by = "month")[, k := obs / model]
+P_mon <- sapply(names(cf_lab), function(r) hr_daily[run == r][, pr_raw * hr_k_mon$k[match(month, hr_k_mon$month)]])
+colnames(P_mon) <- paste0(colnames(P_mon), "_monthly")
+P_chk <- cbind(observed = obs_hr$pr, P_mon)
+```
+
+```{r proc-demand, include = FALSE}
+# ---- Use: visitation (NPS IRMA) and the system's users --------------------------------
+# Monthly visitor statistics from NPS IRMA (recreation visits, tent campers, etc.), saved by
+# getUnitVisitation() in proc-download
+vis <- data.table::as.data.table(arrow::read_parquet(f_visits))
+vis_y <- vis[, .(visitors = sum(RecreationVisitors), tent = sum(TentCampers), months = .N), by = Year][months == 12][order(Year)]
+vis_trend <- list(sen = 10 * unname(trend::sens.slope(vis_y$visitors)$estimates), p = trend::mk.test(vis_y$visitors)$p.value)
+vis_recent <- vis_y[Year >= max(Year) - 3]
+ut21_gpd <- 2000 / 7                                                  # weekly 2,000-gal haul (WSD)
+
+# Recreation.gov reservations (RIDB historical reservation data, one file per fiscal year):
+# Hosmer Grove Campground (facility 10068557) and the summit sunrise reservations (253731).
+# Rows repeated across yearly files are dropped; years are fiscal years (Oct-Sep) of the
+# reservation's start date, kept only when complete.
+# Saved by get_ridb_reservations() in proc-download, which downloads each fiscal year's national
+# reservation file (0.1-0.5 GB zip) and keeps only these facilities' rows (res_ids)
+res <- data.table::as.data.table(arrow::read_parquet(f_res))
+res <- unique(res, by = "historicalreservationid")
+res[, `:=`(fac = names(res_ids)[match(facilityid, res_ids)], start = as.Date(substr(startdate, 1, 10)), end = as.Date(substr(enddate, 1, 10)))]
+res[, `:=`(fy = as.integer(format(start, "%Y")) + (as.integer(format(start, "%m")) >= 10L), month = as.integer(format(start, "%m")),
+           nights_n = pmax(1, as.numeric(end - start)), people = suppressWarnings(as.numeric(numberofpeople)))]
+res_first <- res[, .(first = min(start)), by = fac]                     # first booking: partial first year is dropped below
+res_fy <- res[, .(reservations = .N, site_nights = sum(nights_n), person_nights = sum(nights_n * people, na.rm = TRUE)), by = .(fac, fy)]
+res_fy <- merge(res_fy, res_first, by = "fac")[fy > as.integer(format(first, "%Y")) + (as.integer(format(first, "%m")) >= 10L)][order(fac, fy)]
+# Bookings per night. The files keep reservations later cancelled or changed (no flag), so
+# a night can show more bookings than sites; report how often every site was booked instead.
+res_night <- res[res_fy[fac == "hosmer", .(fac, fy)], on = .(fac, fy), nomatch = 0][
+  , .(d = as.numeric(seq(start, max(start, end - 1), by = "day"))), by = historicalreservationid][, .N, by = d]
+res_stat <- list(hos_full = 100 * mean(res_night$N >= hosmer_cap$sites),
+                 hos_people = res[fac == "hosmer" & fy %in% res_fy[fac == "hosmer"]$fy, mean(people, na.rm = TRUE)],
+                 sun_day = stats::median(res[res_fy[fac == "sunrise", .(fac, fy)], on = .(fac, fy), nomatch = 0][, .N, by = start]$N))
+# Share of each facility's reservations falling in each month, over its complete fiscal years
+res_mon <- res[res_fy[, .(fac, fy)], on = .(fac, fy), nomatch = 0][, .(n = .N), by = .(fac, month)][, share := 100 * n / sum(n), by = fac]
+```
+
+```{r proc-tank, include = FALSE}
+# ---- Can 550,000 gallons of storage meet demand? Daily yield-after-spillage tank model ----
+# Every assumption (C_eff, dem_gpd, catchment_acres) is set at the top of the report's constants
+# chunk and marked {{ASSUMPTION}} in the text.
+gpd_grid <- c(1000, 2000, 3000, 4000, 5000, 6000, 7500, 10000)
+area_grid <- c(seq(0.1, 20, by = 0.1), seq(20.25, 80, by = 0.25))   # acres
+# hi_catchment_needed(): runs the daily tank model (hi_tank_yas(): each day supply the smaller of
+# demand and what the tanks hold, then add the day's catch, spilling anything over capacity) for
+# every rain series x demand x catchment area, and returns the smallest area with no shortfall
+# on any day. Catch (gallons) = rain (mm) x area (m²) x collection efficiency x 0.264 gal/L.
+need <- hi_catchment_needed(cbind(P, P_chk), summit_storage, gpd_grid, area_grid, eff = C_eff)
+# Check (appendix): the same with the partly missing model days counted as dry instead of filled
+P_dry <- P
+for (i in seq_len(nrow(hr_miss))) P_dry[match(hr_miss$date[i], hr_days), hr_miss$run[i]] <- 0
+need_dry <- hi_catchment_needed(P_dry, summit_storage, dem_gpd, area_grid, eff = C_eff)
+# The placeholder catchment: just large enough to meet the assumed demand in the present-day
+# run, unless set explicitly
+acres <- if (is.na(catchment_acres)) need[CF == "present" & gpd == dem_gpd]$acres_100 else catchment_acres
+short_dry <- sapply(colnames(P_dry), function(x) sum(hi_shortfall_days(P_dry[, x], acres * m2_per_acre, summit_storage, dem_gpd, eff = C_eff)))
+# Daily storage trace for the figure, and shortfall days: the same tank model written out, run
+# once per series at the placeholder catchment and assumed demand
+trace <- data.table::rbindlist(lapply(colnames(P), function(s) {
+  V <- summit_storage; v <- numeric(nrow(P)); short <- logical(nrow(P))
+  q <- acres * m2_per_acre * C_eff * gal_per_liter
+  for (t in seq_len(nrow(P))) { Y <- min(dem_gpd, V); short[t] <- Y < dem_gpd - 1e-9; V <- min(V + P[t, s] * q, summit_storage) - Y; v[t] <- V }
+  data.table::data.table(CF = s, date = hr_days, storage = v, short = short)
+}))
+trace[, `:=`(month = as.integer(format(date, "%m")), wy = hi_water_year(as.integer(format(date, "%Y")), as.integer(format(date, "%m"))))]
+short_sum <- trace[, .(short_days = sum(short), short_yr = 365.25 * mean(short), min_pct = 100 * min(storage) / summit_storage,
+                       years_short = data.table::uniqueN(wy[short]),
+                       longest = { r <- rle(short); if (any(r$values)) max(r$lengths[r$values]) else 0L }), by = CF]
+short_mon <- trace[short == TRUE, .N, by = .(CF, month)]                # when in the year shortfalls fall
+```
+
+```{r proc-storms, include = FALSE}
+# ---- Severe storms: what has happened (NOAA, NWS, HCDP) and what the futures show (HRCM wind) ----
+# Past: NOAA Storm Events in the Haleakalā summit forecast zone (wind magnitudes are gusts in
+# knots), Maui events in 2026, and the NWS alerts issued for that zone.
+storm_ev <- data.table::as.data.table(arrow::read_parquet(f_storm))
+storm_ev[, `:=`(date = as.Date(paste0(begin_yearmonth, sprintf("%02d", as.integer(begin_day))), "%Y%m%d"),
+                kt = suppressWarnings(as.numeric(magnitude)))]
+summit_ev <- storm_ev[cz_name == "HALEAKALA SUMMIT" & event_type %in% c("High Wind", "Strong Wind", "Winter Storm", "Winter Weather")][order(date)]
+maui_2026 <- storm_ev[format(date, "%Y") == "2026" & grepl("MAUI|HALEAKALA", cz_name) &
+                        event_type %in% c("High Wind", "Strong Wind", "Flash Flood", "Flood", "Heavy Rain")][order(date)]
+dmg_usd <- function(x) { m <- c(K = 1e3, M = 1e6, B = 1e9)[sub(".*([KMB])$", "\\1", x)]; suppressWarnings(as.numeric(sub("[KMB]$", "", x))) * ifelse(is.na(m), 1, m) }
+alerts <- data.table::as.data.table(arrow::read_parquet(f_alerts))
+alert_n <- alerts[, .N, by = name]
+# The park's own alerts (NPS, daily snapshots of posted alerts): one row per alert text, with the
+# first and last day it was seen. Used for outages, closures and drought in the text.
+park_alerts <- data.table::rbindlist(lapply(list.files(park_alerts_dir, "\\.rds$", full.names = TRUE), function(f)
+  data.table::as.data.table(readRDS(f))[UNIT_CODE == park]))
+pa <- park_alerts[, .(first = min(date), last = max(date)), by = Description][order(first)]
+pa_has <- function(pattern) any(grepl(pattern, pa$Description, ignore.case = TRUE))   # guards for statements in the text
+pa_last_seen <- max(park_alerts$date)
+# Observed extreme rain at the Summit District (HCDP rain maps)
+obs_top <- obs[!is.na(pr)][order(-pr)][1:5, .(date, pr_in = pr / 25.4)]
+# Future: hourly 10-m wind at the Summit District's 9 cells in each run (m/s -> mph). The futures
+# replay the same weather, so this shows how the same storms' winds change, not how often
+# storms come. Hourly means, not gusts.
+hr_wind <- data.table::rbindlist(lapply(names(hr_runs), function(r) {
+  w <- data.table::as.data.table(arrow::read_parquet(file.path(hrcm_dir, paste0(hr_runs[[r]], "_wind.parquet"))))
+  w[, .(spd = mean(sqrt(u10^2 + v10^2)), u = mean(u10), v = mean(v10)), by = time_utc][, run := r]
+}))
+hr_wind[, `:=`(mph = spd * 2.23694, dir_from = (atan2(-u, -v) * 180 / pi) %% 360,
+               month = as.integer(format(time_utc - 10 * 3600, "%m")), year = as.integer(format(time_utc - 10 * 3600, "%Y")))]
+hr_wind[, wy := hi_water_year(year, month)]
+wind_thr <- stats::quantile(hr_wind[run == "present" & wy %in% hr_wys]$mph, 0.99)   # strong wind: top 1% of present-day hours
+wind_wy <- hr_wind[wy %in% hr_wys, .(max_mph = max(mph), strong_h = sum(mph >= wind_thr),
+                                     kona_h = sum(mph >= wind_thr & dir_from >= 135 & dir_from <= 315)), by = .(run, wy)]
+wind_chg <- data.table::rbindlist(lapply(c("cf1", "cf2"), function(f) data.table::rbindlist(lapply(c("max_mph", "strong_h", "kona_h"), function(m) {
+  a <- wind_wy[run == "present"][order(wy)][[m]]; b <- wind_wy[run == f][order(wy)][[m]]
+  data.table::data.table(cf = f, m = m, present = mean(a), future = mean(b), pct = 100 * (mean(b) / mean(a) - 1),
+                         p = stats::t.test(b, a, paired = TRUE)$p.value) }))))
+```
+
+```{r proc-figures, include = FALSE}
+# ---- Figure: the water systems on NPS Park Tiles, with mean annual rain -------------------
+# tiles_for(): NPS Park Tiles basemap for a box (Web Mercator metres), saved as a GeoTIFF; the
+# tiles are downloaded (get_nps_basemap()) only when rerun_downloads is TRUE, otherwise the saved
+# file is read. geom_nps_basemap() draws them under other layers.
+tiles_for <- function(xlim, ylim, style, zoom, file) {
+  f <- file.path("hi_datasets", paste0(park, "_nps_", file, ".tif"))
+  if (rerun_downloads) {
+    aoi <- sf::st_as_sf(sf::st_as_sfc(sf::st_bbox(c(xmin = xlim[1], xmax = xlim[2], ymin = ylim[1], ymax = ylim[2]), crs = 3857)))
+    terra::writeRaster(get_nps_basemap(aoi, style = style, buffer_km = 0.3, zoom = zoom), f, overwrite = TRUE)
+  }
+  terra::rast(f)
+}
+rain_3857 <- terra::project(mean_r, "EPSG:3857")
+rain_df <- terra::as.data.frame(rain_3857, xy = TRUE)
+iso_in <- c(30, 50, 80, 120, 200)                                      # isohyets (inches)
+# Contour lines (isohyets) of mean annual rain at the inch values in iso_in
+iso_all <- do.call(rbind, lapply(iso_in, function(v) {
+  l <- sf::st_as_sf(terra::as.contour(rain_3857, levels = v * 25.4)); if (nrow(l)) l$inch <- v; l[, "inch"] }))
+# to_m(): labeled points from lon/lat, in the map's Web Mercator CRS
+to_m <- function(lon, lat, lab) sf::st_sf(lab = lab, geometry = sf::st_transform(sf::st_sfc(lapply(seq_along(lon), function(i) sf::st_point(c(lon[i], lat[i]))), crs = 4326), 3857))
+cat_m <- sf::st_transform(summit_pt, 3857)
+# Where the catchment's water is used: visitor centers from recreation.gov; Hosmer Grove Campground
+# from OpenStreetMap (camp_site node 571276260; recreation.gov lists it at 0, 0). Housing,
+# maintenance and the entrance station are also served but have no published coordinates.
+hosmer_ll <- c(lon = -156.2376620, lat = 20.7685116)
+use_m <- to_m(c(hq_vc$FacilityLongitude, hosmer_ll[["lon"]], vc$FacilityLongitude),
+              c(hq_vc$FacilityLatitude, hosmer_ll[["lat"]], vc$FacilityLatitude),
+              c("Park Headquarters\nVisitor Center", "Hosmer Grove\nCampground", "Haleakalā Visitor Center\n(water hauled weekly)"))
+vc_m <- use_m[3, ]
+gauge_m <- to_m(gauge_meta$longitude, gauge_meta$latitude, gauge_use[gauge_meta$id])
+xy <- function(g) sf::st_coordinates(g)[1, ]                           # x, y of a point
+# Arrows from the catchment to the places its water goes (the visitor center by weekly haul)
+flow <- data.table::rbindlist(lapply(list(vc_m, use_m[2, ]), function(g)
+  data.table::data.table(x = xy(cat_m)[1], y = xy(cat_m)[2], xend = xy(g)[1], yend = xy(g)[2])))
+park_m <- sf::st_transform(park_boundary, 3857)
+rain_fill <- scale_fill_gradientn("Mean annual rain,\n1991-2025 (in)", colours = c("#F3E3C3", "#C9D8A8", "#7DB8A6", "#3C8DA3", "#23557E", "#1B2F59"),
+                                  trans = "log10", breaks = c(30, 60, 120, 240), oob = scales::squish)
+# The map: rain, isohyets, park outline on top, the system and where its water goes, the gauges
+gx <- xy(gauge_m[grepl("Kula", gauge_m$lab), ])
+xl_a <- c(min(range(rain_df$x)[1], gx[1]) - 1500, range(rain_df$x)[2] + 1200); yl_a <- range(rain_df$y) + c(-1200, 4000)
+tiles_a <- tiles_for(xl_a, yl_a, "light", 12, "park_light_wide2")
+# Labels placed by hand (offsets in metres from each point), joined to their points by thin leader lines
+lab_pts <- data.table::data.table(
+  lab = c("Summit District rain catchment\nand 550,000-gal tanks", "Hosmer Grove\nCampground",
+          "Park Headquarters Visitor Center\nand Summit District gauge", "Haleakalā Visitor Center\n(water hauled weekly)", "Kula gauge"),
+  x = c(xy(cat_m)[1], xy(use_m[2, ])[1], xy(use_m[1, ])[1], xy(vc_m)[1], gx[1]),
+  y = c(xy(cat_m)[2], xy(use_m[2, ])[2], xy(use_m[1, ])[2], xy(vc_m)[2], gx[2]),
+  dx = c(-4600, 5200, -4400, -5200, 0), dy = c(2700, 2300, -3300, -3000, 2400))
+lab_pts[, `:=`(lx = x + dx, ly = y + dy)]
+p_map_a <- ggplot() + geom_nps_basemap(tiles_a) +
+  geom_raster(data = rain_df, aes(x, y, fill = pr_mm / 25.4), alpha = 0.7) + rain_fill +
+  geom_sf(data = iso_all, color = "grey20", linewidth = 0.25, alpha = 0.8) +
+  geom_sf_text(data = sf::st_point_on_surface(iso_all), aes(label = paste0(inch, " in")), size = 2.2, color = "grey10") +
+  geom_sf(data = park_m, fill = NA, color = "#3b2a1a", linewidth = 0.7) +
+  geom_curve(data = flow, aes(x = x, y = y, xend = xend, yend = yend), curvature = -0.3, linewidth = 0.45, color = "#B03A2E",
+             arrow = grid::arrow(length = grid::unit(0.16, "cm"), type = "closed")) +
+  geom_segment(data = lab_pts, aes(x = x, y = y, xend = lx, yend = ly), linewidth = 0.25, color = "grey25") +
+  geom_sf(data = gauge_m, aes(shape = "Rain gauge"), size = 4, fill = "#1FB5C2", stroke = 0.8) +
+  geom_sf(data = cat_m, aes(shape = "Rain catchment and tanks"), size = 5.5, fill = "#B03A2E", stroke = 1) +
+  geom_sf(data = use_m, aes(shape = "Uses the system's water"), size = 2.4, fill = "white", stroke = 0.8) +
+  scale_shape_manual(NULL, values = c("Rain catchment and tanks" = 21, "Uses the system's water" = 22, "Rain gauge" = 24),
+                     guide = guide_legend(override.aes = list(fill = c("#B03A2E", "#1FB5C2", "white"), size = c(4, 3.4, 2.4)))) +
+  geom_label(data = lab_pts, aes(lx, ly, label = lab), size = 2.3, lineheight = 0.95, label.size = 0.15,
+             label.padding = grid::unit(0.15, "lines"), fill = scales::alpha("white", 0.92)) +
+  coord_sf(crs = 3857, expand = FALSE, xlim = xl_a, ylim = yl_a) +
+  labs(x = NULL, y = NULL) +
+  theme_void(base_size = 8) + theme(legend.position = "left", legend.box = "vertical")
+# Inset: Maui, with the park highlighted
+maui <- sf::st_as_sf(sf::st_as_sfc(sf::st_bbox(c(xmin = -156.72, xmax = -155.95, ymin = 20.55, ymax = 21.05), crs = 4326)))
+mb <- as.list(unclass(sf::st_bbox(sf::st_transform(maui, 3857))))   # plain numbers (named bbox values break tiles_for())
+tiles_maui <- tiles_for(c(mb$xmin, mb$xmax), c(mb$ymin, mb$ymax), "light", 9, "maui_light")
+p_maui <- ggplot() + geom_nps_basemap(tiles_maui) +
+  geom_sf(data = park_m, fill = "#B03A2E", color = "#B03A2E", alpha = 0.6, linewidth = 0.3) +
+  annotate("text", x = mean(c(mb$xmin, mb$xmax)) - 15000, y = mb$ymax - 9000, label = "Maui", size = 3, fontface = "bold") +
+  coord_sf(crs = 3857, expand = FALSE, xlim = c(mb$xmin, mb$xmax), ylim = c(mb$ymin, mb$ymax)) +
+  theme_void() + theme(panel.border = element_rect(color = "grey30", fill = NA, linewidth = 0.5))
+figs$map <- list(p = p_map_a + patchwork::inset_element(p_maui, left = 0, bottom = 0, right = 0.3, top = 0.36, align_to = "panel") +
+                   patchwork::plot_annotation(caption = paste0("Basemap: NPS Park Tiles. Catchment location from the NPS Water Supply Database (location confidence: low); other locations from recreation.gov, OpenStreetMap and NOAA GHCN-Daily.\n",
+                                                               "Isohyets: HCDP rain maps, mean annual rain, Hawaiʻi water years 1991-2025. Housing, maintenance areas and the entrance station also use the system's water but are not mapped."),
+                                              theme = theme(plot.caption = element_text(size = 7, hjust = 0))),
+                 w = 9, h = 5.6)
+save_fig(figs$map$p, "Summit_map", 9, 5.6)
+
+# ---- Figure: rain is already changing at the Summit District -----------------------------------
+# (a) amount: gauge and HCDP map; (b) timing: monthly rain, first vs. second half of the
+# gauge record; (c) rain days and (d) dry spells: gauge only (event counts from interpolated
+# daily maps are not comparable with a gauge)
+src_lab <- c(Gauge = rs_lab, `HCDP map` = "HCDP rain maps, Summit District")
+src_col <- c(Gauge = "#1B2F59", `HCDP map` = "#E1A33B")
+ann_d <- rbind(rs[, .(src = "Gauge", water_year, v = annual_mm / 25.4)], hcdp_i[, .(src = "HCDP map", water_year, v = annual_mm / 25.4)])
+ann_d[, roll := data.table::frollmean(v, 10, align = "center"), by = src]
+# One trend panel: yearly points joined by a light grey line, plus the 10-year running mean
+tr_panel <- function(d, ylab, title) ggplot(d, aes(water_year, v, color = src)) +
+  geom_line(aes(group = src), color = "grey80", linewidth = 0.35) +
+  geom_point(size = 0.9, alpha = 0.5) + geom_line(aes(y = roll), linewidth = 1.1, na.rm = TRUE) +
+  scale_color_manual(NULL, values = src_col, labels = src_lab) +
+  labs(x = "Hawaiʻi water year", y = ylab, title = title) + theme_cf
+p_t_a <- tr_panel(ann_d, "Rain (in)", "(a) How much: annual rain")
+ev <- data.table::melt(rs[, .(src = "Gauge", water_year, wet_days, cdd_dry_season)], id.vars = c("src", "water_year"))[
+  , roll := data.table::frollmean(value, 10, align = "center"), by = variable]
+p_t_c <- tr_panel(ev[variable == "wet_days", .(src, water_year, v = value, roll)], "Days per year", "(c) Rain days (≥ 0.04 in)")
+p_t_d <- tr_panel(ev[variable == "cdd_dry_season", .(src, water_year, v = value, roll)], "Days", "(d) Longest dry-season dry spell")
+# hi_wy_month() / hi_scale_x_wy_month(): order months Nov ... Oct (the Hawaiʻi water year) on the x axis
+p_t_b <- ggplot(rs_mon[, .(half = factor(rs_halves[half], rs_halves), m = hi_wy_month(month), v = mm / 25.4)], aes(m, v, fill = half)) +
+  annotate("rect", xmin = 6.5, xmax = 12.5, ymin = -Inf, ymax = Inf, fill = "grey93") +   # dry season, May-Oct (as in Figure 6)
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) + hi_scale_x_wy_month() +
+  scale_fill_manual("Hawaiʻi water years", values = c("#9ECAE1", "#1B2F59")) +
+  labs(x = NULL, y = "Mean monthly rain (in)", title = "(b) When: monthly rain at the gauge") + theme_cf
+inside <- theme(legend.position = "inside", legend.position.inside = c(0.98, 0.98), legend.justification = c(1, 1),
+                legend.background = element_rect(fill = scales::alpha("white", 0.85), color = "grey70", linewidth = 0.2),
+                legend.title = element_text(size = 7), legend.text = element_text(size = 7))
+figs$trend <- list(p = patchwork::wrap_plots(p_t_a + theme(legend.position = "bottom", legend.direction = "vertical"), p_t_b + inside,
+                                             p_t_c + theme(legend.position = "none"), p_t_d + theme(legend.position = "none"), ncol = 2) +
+                     patchwork::plot_annotation(caption = paste0("Points: each complete Hawaiʻi water year. Lines: 10-year running mean. Panels (c) and (d): ", rs_lab, " (Haleakalā Ranger Station, ", scales::comma(round(gauge_meta[id == "USC00511004"]$elevation * 3.28084)), " ft)."),
+                                                theme = theme(plot.caption = element_text(size = 7))), w = 8.5, h = 6.2)
+save_fig(figs$trend$p, "Summit_rain_trends", 8.5, 6.2)
+
+# ---- Figure: the rain shadow is widening (2,000-mm line each water year; area each water year) ---
+iso_df <- terra::as.data.frame(mean_r, xy = TRUE)
+yr_col <- scale_color_gradientn("Hawaiʻi\nwater year", colours = grDevices::hcl.colors(9, "Spectral", rev = TRUE),
+                                limits = range(iso_wy), breaks = seq(1995, 2025, 10))
+p_iso_a <- ggplot() + geom_raster(data = iso_df, aes(x, y, fill = pr_mm / 25.4)) +
+  scale_fill_gradient("Mean annual\nrain (in),\n1991-2025", low = "grey96", high = "grey35", trans = "log10", breaks = c(30, 60, 120, 240)) +
+  geom_sf(data = park_poly, fill = NA, color = "grey15", linewidth = 0.3) +
+  geom_sf(data = iso_lines_wy, aes(color = wy), linewidth = 0.45, alpha = 0.9) + yr_col +
+  geom_sf(data = summit_pt, shape = 21, fill = "#B03A2E", size = 2.4) +
+  coord_sf(expand = FALSE) + labs(x = NULL, y = NULL, title = "(a) Where the 79-inch line sits, each year") +
+  theme_bw(base_size = 8) + theme(legend.position = "none")
+# Sen's slope line through the median point, for panel (b)
+iso_fit <- data.table::data.table(wy = range(iso_area$wy))[, km2 := stats::median(iso_area$km2) + iso_trend$sen / 10 * (wy - stats::median(iso_area$wy))]
+# Background: El Niño / La Niña winters shaded; PDO phase as a band along the top
+shade <- climate_wy[wy %in% iso_wy]
+ytop <- max(iso_area$km2) * 1.12
+enso_fill <- c("El Niño" = "#F6D3B5", "La Niña" = "#C9DDEE", "Positive PDO" = "#D9822B", "Negative PDO" = "#3E7CB1")
+p_iso_b <- ggplot(iso_area, aes(wy, km2)) +
+  geom_rect(data = shade[enso != "Neutral"], aes(xmin = wy - 0.5, xmax = wy + 0.5, ymin = -Inf, ymax = ytop * 0.955, fill = enso),
+            inherit.aes = FALSE, alpha = 0.8) +
+  geom_rect(data = shade, aes(xmin = wy - 0.5, xmax = wy + 0.5, ymin = ytop * 0.97, ymax = ytop, fill = phase), inherit.aes = FALSE) +
+  scale_fill_manual(NULL, values = enso_fill, breaks = names(enso_fill)) +
+  geom_line(color = "grey55", linewidth = 0.4) + geom_point(aes(color = wy), size = 1.8) + yr_col +
+  geom_line(data = iso_fit, color = "black", linewidth = 0.7, linetype = "22") +
+  scale_y_continuous(limits = c(0, ytop), expand = expansion(mult = c(0, 0.01))) +
+  labs(x = "Hawaiʻi water year", y = "Park area with ≥ 79 in of rain (km²)", title = "(b) How much of the park gets it") +
+  theme_cf + theme(legend.box = "vertical") + guides(fill = guide_legend(nrow = 2, byrow = TRUE), color = guide_colorbar(barwidth = 8, barheight = 0.5))
+figs$shadow <- list(p = patchwork::wrap_plots(p_iso_a, p_iso_b, nrow = 1, widths = c(1.45, 1)), w = 9, h = 5)
+save_fig(figs$shadow$p, "Summit_rain_shadow", 9, 5)
+
+# ---- Figure: rain at the Summit in the two futures (HRCM) ---------------------------------
+show_m <- c("ann", "dry_mm", "wet_mm", "rain_days", "cdd_dry", "wet_spell", "heavy", "rx1", "hmax")
+hc <- hr_chg[m %in% show_m][, `:=`(meas = factor(hr_meas[m], rev(hr_meas[show_m])), cf = factor(cf_lab[cf], cf_lab[c("cf2", "cf1")]),
+                                  sig = p < 0.05)]
+hc <- merge(hc, hr_bias[, .(m, ratio)], by = "m", all.x = TRUE)
+hc[, caution := !is.na(ratio) & (ratio < 2 / 3 | ratio > 1.5)]
+# group = cf: bars and labels dodge by future only (not by significance), so labels stay on their bars
+p_hr <- ggplot(hc, aes(pct, meas, fill = cf, group = cf)) + geom_vline(xintercept = 0, linewidth = 0.4) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7, aes(alpha = sig, color = cf), linewidth = 0.3, show.legend = c(color = FALSE)) +
+  scale_color_manual(NULL, values = stats::setNames(cf_cols[c("cf1", "cf2")], cf_lab[c("cf1", "cf2")]), guide = "none") +
+  geom_text(aes(label = paste0(ifelse(pct > 0, "+", ""), round(pct), "%"), hjust = ifelse(pct >= 0, -0.15, 1.15)),
+            position = position_dodge(width = 0.75), size = 2.3) +
+  scale_fill_manual(NULL, values = c(cf_cols[["cf1"]], cf_cols[["cf2"]]) |> stats::setNames(cf_lab[c("cf1", "cf2")]), breaks = unname(cf_lab[c("cf1", "cf2")])) +
+  scale_alpha_manual(NULL, values = c(`TRUE` = 1, `FALSE` = 0.35), labels = c(`TRUE` = "Significant (p < 0.05)", `FALSE` = "Not significant")) +
+  scale_x_continuous(expand = expansion(mult = 0.2)) +
+  labs(x = "Change, late century vs. present-day run (%)", y = NULL) + theme_cf + theme(legend.box = "vertical")
+# save_fig(): writes the PNG to data/park/HALE/Figs/ and returns the plot with its width and height
+# (used by the report's chunk options)
+figs$hrcm <- save_fig(p_hr, "Summit_HRCM_changes", 7, 4.6)
+
+# ---- Figure: the same statistics year by year (present-day run grey; futures purple and red) --
+# All three runs replay the same 19 weather years, so they are overlaid by year of the run
+# (year 1 = water year 1991 in the present-day run; the futures stand for 2081-2099).
+run_year_x <- scale_x_continuous(breaks = c(1, 5, 10, 15, 19), labels = function(b) paste("Year", b))
+ts_unit <- c(ann = "in", dry_mm = "in", wet_mm = "in", rain_days = "days", cdd_dry = "days", wet_spell = "days",
+             heavy = "days", rx1 = "in", hmax = "in")
+hts <- data.table::melt(hr_wy[, c("run", "wy", show_m), with = FALSE], id.vars = c("run", "wy"), variable.name = "m")
+hts[, `:=`(m = as.character(m), year = wy - min(hr_wys) + 1L)]
+hts[ts_unit[m] == "in", value := value / 25.4]
+hts[, panel := factor(paste0(hr_meas[m], " (", ts_unit[m], ")"), paste0(hr_meas[show_m], " (", ts_unit[show_m], ")"))]
+hts[, cfl := factor(cf_lab[run], cf_lab)]
+p_hts <- ggplot(hts, aes(year, value, color = cfl, group = cfl)) +
+  geom_line(linewidth = 0.5, alpha = 0.85) + geom_point(size = 1.3, alpha = 0.9) +
+  facet_wrap(~panel, ncol = 1, scales = "free_y", strip.position = "top") +
+  scale_color_manual(NULL, values = stats::setNames(cf_cols, cf_lab)) +
+  run_year_x + labs(x = NULL, y = NULL) + theme_cf
+figs$hrcm_ts <- save_fig(p_hts, "Summit_HRCM_timeseries", 7.5, 15)
+
+# ---- Figure: when rain falls (observed vs. corrected present-day run; the runs' monthly change) --
+mon_src <- c(observed = "Observed (HCDP)", present = "Present-day run, corrected")
+p_mon_a <- ggplot(hr_mon[run %in% names(mon_src), .(src = factor(mon_src[run], mon_src), m = hi_wy_month(month), v = mm / 25.4)], aes(m, v, fill = src)) +
+  annotate("rect", xmin = 6.5, xmax = 12.5, ymin = -Inf, ymax = Inf, fill = "grey93") +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) + hi_scale_x_wy_month() +
+  scale_fill_manual(NULL, values = stats::setNames(c("#3C8DA3", cf_cols[["present"]]), mon_src)) +
+  labs(x = NULL, y = "Mean monthly rain (in)", title = paste0("(a) Observed and model, ", min(hr_wys), "-", max(hr_wys))) + theme_cf
+p_mon_b <- ggplot(mon_fac[, .(cf = factor(cf_lab[run], cf_lab[c("cf1", "cf2")]), m = hi_wy_month(month), pct = 100 * (fac - 1))], aes(m, pct, fill = cf)) +
+  annotate("rect", xmin = 6.5, xmax = 12.5, ymin = -Inf, ymax = Inf, fill = "grey93") +
+  geom_hline(yintercept = 0, linewidth = 0.3) + geom_col(position = position_dodge(width = 0.8), width = 0.75) + hi_scale_x_wy_month() +
+  scale_fill_manual(NULL, values = stats::setNames(cf_cols[c("cf1", "cf2")], cf_lab[c("cf1", "cf2")])) +
+  labs(x = NULL, y = "Change in monthly rain (%)", title = "(b) Change in each month, model runs") + theme_cf
+figs$monthly <- list(p = patchwork::wrap_plots(p_mon_a, p_mon_b, nrow = 1, widths = c(1, 1.3)), w = 8, h = 3.3)
+save_fig(figs$monthly$p, "Summit_monthly_rain", 8, 3.3)
+
+# ---- Figure: visitation -----------------------------------------------------------------------
+p_vis <- ggplot(vis_y, aes(Year, visitors / 1e6)) + geom_col(fill = "#3C8DA3", width = 0.8) +
+  labs(x = "Calendar year", y = "Recreation visits (millions)", title = "(a) Park-wide recreation visits") + theme_cf
+fy_lab <- "Fiscal year of the stay (Oct-Sep)"
+p_hos <- ggplot(res_fy[fac == "hosmer"], aes(fy, site_nights)) + geom_col(fill = "#7DB8A6", width = 0.7) +
+  scale_x_continuous(breaks = function(l) seq(ceiling(l[1]), floor(l[2]), 1)) +
+  labs(x = fy_lab, y = "Site-nights reserved", title = "(b) Hosmer Grove Campground") + theme_cf
+p_sun <- ggplot(res_fy[fac == "sunrise"], aes(fy, reservations / 1000)) + geom_col(fill = "#E1A33B", width = 0.7) +
+  labs(x = fy_lab, y = "Reservations (thousands)", title = "(c) Summit sunrise reservations") + theme_cf
+figs$visits <- list(p = patchwork::wrap_plots(p_vis, p_hos, p_sun, ncol = 3, widths = c(1.6, 1, 1)), w = 10, h = 3.2)
+save_fig(figs$visits$p, "Summit_visitation", 10, 3.2)
+
+# ---- Figure: lowest storage reached each water year -----------------------------------------
+low <- trace[, .(low = 100 * min(storage) / summit_storage, short = sum(short)), by = .(CF, wy)][, cf := factor(cf_lab[CF], cf_lab)]
+low[, run_year := wy - min(hr_wys) + 1L]                               # year of the 19-year run
+p_store <- ggplot(low, aes(run_year, low, color = cf)) +
+  geom_hline(yintercept = 0, linewidth = 0.4) +
+  geom_line(linewidth = 0.5, alpha = 0.7) + geom_point(aes(shape = short > 0), size = 1.8) +
+  scale_shape_manual(NULL, values = c(`FALSE` = 16, `TRUE` = 4), labels = c(`FALSE` = "Demand met all year", `TRUE` = "Tanks ran dry")) +
+  scale_color_manual(NULL, values = stats::setNames(cf_cols, cf_lab)) +
+  run_year_x + labs(x = NULL, y = "Lowest storage reached (% full)") + theme_cf + theme(legend.box = "vertical")
+figs$storage <- save_fig(p_store, "Summit_lowest_storage", 7.5, 4)
+
+lab_all <- c(cf_lab, observed = "Observed rain, same years (check)")
+need_plot <- need[CF %in% names(lab_all) & !is.na(acres_100)][, cfl := factor(lab_all[CF], lab_all)]
+p_need <- ggplot(need_plot, aes(gpd, acres_100, color = cfl, linetype = cfl)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.3) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  scale_y_log10(breaks = c(0.5, 1, 2, 5, 10, 20, 50), labels = scales::label_number()) +
+  scale_color_manual(NULL, values = stats::setNames(c(cf_cols, "black"), lab_all)) +
+  scale_linetype_manual(NULL, values = stats::setNames(c("solid", "solid", "solid", "dashed"), lab_all)) +
+  labs(x = "Constant demand (gallons per day)", y = "Catchment needed (acres, log scale)") + theme_cf +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE), linetype = guide_legend(nrow = 2, byrow = TRUE))
+figs$need <- save_fig(p_need, "Summit_catchment_needed", 6.5, 4)
+
+# ---- Figure: severe storms, past (NWS alerts for the summit zone) and future (strong-wind hours) ----
+alert_keep <- c("High Wind Warning", "Tropical Storm Warning", "Hurricane Warning", "Winter Storm Warning")
+al_y <- alerts[name %in% alert_keep, .N, by = .(y = as.integer(format(issue, "%Y")), name)][, name := factor(name, alert_keep)]
+p_st_a <- ggplot(al_y, aes(y, N, fill = name)) + geom_col(width = 0.8) +
+  scale_fill_manual(NULL, values = c("#3C8DA3", "#E1A33B", "#B03A2E", "#9ECAE1")) +
+  scale_y_continuous(breaks = function(l) seq(0, ceiling(l[2]), 1)) +
+  labs(x = "Calendar year", y = "Warnings issued", title = "(a) NWS warnings, Haleakalā summit zone") + theme_cf + guides(fill = guide_legend(nrow = 2))
+p_st_b <- ggplot(wind_wy[, .(cfl = factor(cf_lab[run], cf_lab), year = wy - min(hr_wys) + 1L, strong_h)], aes(year, strong_h, color = cfl)) +
+  geom_line(linewidth = 0.5, alpha = 0.85) + geom_point(size = 1.4) + run_year_x +
+  scale_color_manual(NULL, values = stats::setNames(cf_cols, cf_lab)) +
+  labs(x = NULL, y = paste0("Hours with wind ≥ ", round(wind_thr), " mph"), title = "(b) Strong-wind hours, model runs") +
+  theme_cf + guides(color = guide_legend(nrow = 3))
+figs$storms <- list(p = patchwork::wrap_plots(p_st_a, p_st_b, nrow = 1), w = 9, h = 3.8)
+save_fig(figs$storms$p, "Summit_storms", 9, 3.8)
+```
+
+```{r proc-tables, include = FALSE}
+# Small helpers for table cells: hcv() one row of hr_chg; in1()/d0() format inches and days;
+# num()/int()/pc()/sig() (hi_src/hi_report_helpers.R) format numbers, integers, signed % and
+# rounded counts
+hcv <- function(x, y) hr_chg[hr_chg$cf == x & hr_chg$m == y]
+in1 <- function(mm) num(mm / 25.4, 1)
+d0 <- function(v) num(v, 0)
+bluf_m <- c(ann = in1, dry_mm = in1, rain_days = d0, cdd_dry = d0)
+acres_at <- function(x) need[need$CF == x & need$gpd == dem_gpd]$acres_100
+short_cell <- function(x) paste0(int(short_sum[CF == x]$short_days), " (", short_sum[CF == x]$years_short, " of ", length(hr_wys), " years)")
+tabs$bluf <- data.table::data.table(
+  Measure = c("Annual rain (in per year)", "Dry-season rain, May-Oct (in per year)", "Rain days (≥ 0.04 in) per year", "Longest dry-season dry spell (days, average year)",
+              paste0("Days demand is not met, ", length(hr_wys), " years ", "{{ASSUMPTION}}"), paste0("Catchment needed for ", int(dem_gpd), " gal/day (acres)")),
+  present = c(sapply(names(bluf_m), function(m) bluf_m[[m]](hcv("cf1", m)$present)), short_cell("present"), num(acres_at("present"), 1)),
+  cf1 = c(sapply(names(bluf_m), function(m) paste0(bluf_m[[m]](hcv("cf1", m)$future), " (", pc(hcv("cf1", m)$pct, 0), ")")), short_cell("cf1"),
+          paste0(num(acres_at("cf1"), 1), " (", pc(100 * (acres_at("cf1") / acres_at("present") - 1), 0), ")")),
+  cf2 = c(sapply(names(bluf_m), function(m) paste0(bluf_m[[m]](hcv("cf2", m)$future), " (", pc(hcv("cf2", m)$pct, 0), ")")), short_cell("cf2"),
+          paste0(num(acres_at("cf2"), 1), " (", pc(100 * (acres_at("cf2") / acres_at("present") - 1), 0), ")")))
+# Future names in the headers coloured as in the figures (classes cf1/cf2, defined in the report's CSS)
+cf_span <- function(x) paste0('<span class="', x, '">', cf_lab[[x]], "</span>")
+data.table::setnames(tabs$bluf, c("Measure", cf_lab[["present"]], cf_span("cf1"), cf_span("cf2")))
+
+rec_lab <- c(setNames(paste0(c("Summit District gauge", "Kula gauge"), " (", g_trend[match(gauge_use, site)]$years, ")"), gauge_use),
+             `HCDP map, Summit District` = paste0("HCDP rain maps, Summit District (", g_trend[site == "HCDP map, Summit District"]$years[1], ")"))
+tabs$trend <- g_trend[, .(Measure = factor(idx[index], idx), rec = factor(rec_lab[site], rec_lab),
+                          v = ifelse(site == "HCDP map, Summit District" & index %in% c("wet_days", "cdd_dry_season", "heavy_days"), "—",
+                                     paste0(ifelse(sen > 0, "+", ""), num(pct_dec, 1), "%", ifelse(p < 0.05, "*", ""))))]
+tabs$trend <- data.table::dcast(tabs$trend, Measure ~ rec, value.var = "v")
+
+tabs$hrcm <- merge(hr_chg[, .(m, cf, present, future, pct, p)], hr_bias[, .(m, ratio_raw, ratio)], by = "m", all.x = TRUE)[
+  , .(Measure = hr_meas[m], cf = cf_lab[cf], v = paste0(pc(pct, 0), ifelse(p < 0.05, "*", "")), ratio_raw, ratio)]
+tabs$hrcm <- data.table::dcast(tabs$hrcm, Measure + ratio_raw + ratio ~ cf, value.var = "v")[match(hr_meas, Measure)]
+data.table::setnames(tabs$hrcm, cf_lab[c("cf1", "cf2")], c(cf_span("cf1"), cf_span("cf2")))
+tabs$hrcm[, `:=`(`Present-day run ÷ observed, before correction` = ifelse(is.na(ratio_raw), "—", num(ratio_raw, 2)),
+                 `... after correction` = ifelse(is.na(ratio), "—", paste0(num(ratio, 2), ifelse(ratio < 2 / 3 | ratio > 1.5, " (caution)", ""))))][
+  , c("ratio_raw", "ratio") := NULL]
+```
+
+# Appendix A: How the analysis was done
+
+**Question.** Could the Summit District's rain catchment, with its 550,000 gallons of storage, meet the park's needs under the two climate futures? The analysis follows the NPS approach of bounding the future with two divergent climate futures (Lawrence et al., 2021; Runyon et al., 2024) and uses the two futures already defined for HALE (NPS, 2023).
+
+**Observed rain.** The HCDP rain maps: daily rain maps from the Hawaiʻi Climate Data Portal (Longman et al., 2019) on a 250-m grid, averaged over the nine cells around the system's location. The record runs from 1990 through `r format(obs_last, "%B %e, %Y")`; Hawaiʻi water years `r min(base_wy)`-`r max(base_wy)` are complete. `r length(obs_na_days)` day (`r paste(format(obs_na_days), collapse = ", ")`) is missing at the source; yearly totals that include it are scaled up by the share of days observed, as for the gauges. The maps describe current rain and the rain shadow, and Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)` set the correction of the climate model's rain (below). Long-term trends use the park's own rain gauge, the Summit District gauge (GHCN-Daily station `r names(gauge_use)[1]`, Haleakalā Ranger Station; Menne et al., 2012), Hawaiʻi water years `r min(rs$water_year)`-`r max(rs$water_year)`, and the Kula gauge (Kula Branch Station, `r min(gi[site == gauge_use[[2]]]$water_year)`-`r max(gi[site == gauge_use[[2]]]$water_year)`). A water year counts when at least 90% of its days were observed. Within those years, rain totals and counts of rain days and heavy days are scaled up by the share of days observed (`calc_precip_indices()`, `scale_missing = TRUE`), so a year with gaps does not look drier. This matters at the Summit District gauge, whose gaps are not spread evenly: `r int(sum(rs[water_year >= 2001]$n_missing))` of its `r int(sum(rs$n_missing))` missing days fall in Hawaiʻi water years 2001-`r max(rs$water_year)`. Counting missing days as dry instead would give a rain-day decline of `r num(abs(rs_noscale$pct_dec), 1)`% per decade (`r ifelse(rs_noscale$p < 0.01, "p < 0.01", paste("p =", num(rs_noscale$p, 2)))`), against `r num(abs(g_trend[site == rs_lab & index == "wet_days"]$pct_dec), 1)`% with scaling. Using only years with at most 3 missing days gives `r pc(rs_strict$pct_dec, 1)` per decade (p = `r num(rs_strict$p, 2)`), but that leaves out most of the 2000s, so it cannot tell a real decline from the gaps. Trends are Sen's slope with the Mann-Kendall test (Sen, 1968; Mann, 1945; Kendall, 1970). Over the Hawaiʻi water years both cover, the Summit District gauge and the HCDP rain maps agree on year-to-year totals (r = `r num(ov_r, 2)`).
+
+**Reservations.** Hosmer Grove Campground (facility 10068557) and summit sunrise (facility 253731) bookings come from the RIDB/Recreation.gov historical reservation files for fiscal years 2017-2025 (RIDB, 2026), downloaded and filtered by `get_ridb_reservations()`. Reservations repeated in two yearly files are counted once, each is assigned to the fiscal year of its start date, and only complete fiscal years are shown. The files do not flag cancellations, so nights can show more bookings than sites.
+
+**Park alerts.** Outages, closures and drought warnings come from the project's archive of the alerts the park posted, captured as daily snapshots from January 2019 through `r format(pa_last_seen, "%B %e, %Y")` (NPS, 2026). The snapshots have gaps, so an alert's first and last dates are approximate.
+
+**Storms.** Past storms come from NOAA's Storm Events Database (NOAA NCEI, 2026b; Hawaiʻi records 1996 on, read by `get_storm_events()`; wind magnitudes are gusts in knots, converted to mph) and the Iowa Environmental Mesonet archive of National Weather Service alerts for the Haleakalā summit zone, HIZ022 (IEM, 2026; `get_nws_alerts()`). Storm Events for 2026 run through `r format(max(storm_ev$date, na.rm = TRUE), "%B %Y")` at the time of download. Future wind is the regional climate model's hourly 10-m wind (`U10`, `V10`), downloaded for the nine cells around the catchment (`hi_hrcm_download_wind()`) and averaged. *Strong wind* is an hour at or above the present-day run's 99th percentile, `r int(wind_thr)` mph. Changes are tested with the same paired t-test as rain. The model's wind is not corrected against observations, so only its changes are used.
+
+**Future rain.** The Hawaiʻi Regional Climate Model (HRCM; Zhang, 2017) is the WRF weather model run on a 0.8-km grid. Its present-day run is driven by observed 1990-2009 weather; each late-century run adds the average change projected by 12 CMIP5 global models under RCP 4.5 or RCP 8.5 to that same weather (pseudo-global warming; Wang, 2017; Zhang et al., 2016). The runs were downloaded hourly for the nine 0.8-km cells around the system (`hi_hrcm_download()`), summed to Hawaiʻi Standard Time days, and compared run against run for Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)`. Model rain is incomplete on `r nrow(hr_miss)` days, because of a gap in the source data or the hour at which a run's running total restarts (`hi_hrcm_cell_rain()`): `r hr_miss_txt`. Each is filled from its valid hours, scaled up to a full day. `r d_acres <- max(abs(merge(need_dry, need[CF %in% names(cf_lab) & gpd == dem_gpd], by = c("CF", "gpd"))[, acres_100.x - acres_100.y])); d_days <- max(abs(short_dry[names(cf_lab)] - short_sum[match(names(cf_lab), CF)]$short_days)); if (d_acres == 0 && d_days == 0) "Counting them as dry instead changes neither the catchment needed nor the days demand is not met." else paste0("Counting them as dry instead changes the catchment needed by at most ", num(d_acres, 1), " acres and the days demand is not met by at most ", int(d_days), ".")` Differences were tested with a paired t-test on the `r length(hr_wys)` Hawaiʻi water years, because the runs share the same weather years (as in Zhang et al., 2016).
+
+**Correcting the model's rain.** The present-day run's rain is too heavy at the Summit (`r tref("hrcm")`). Every run's daily rain is multiplied by one factor for the wet season (November-April, `r num(hr_k[wet == TRUE]$k, 2)`) and one for the dry season (May-October, `r num(hr_k[wet == FALSE]$k, 2)`). Each factor is observed mean rain at the Summit (HCDP, Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)`) divided by the present-day run's, and the same factors apply to both futures. Each future's change in seasonal totals is therefore unchanged, and the model's day-to-day sequence of rain is kept. Rain days, dry spells and heavy days are counted on the corrected rain, so thresholds such as 1 inch apply to rain at the observed scale. One factor per season corrects amounts, not the model's timing within a season: the corrected present-day run has too little rain in November and too much in April and May (`r fref("monthly")`a). Correcting month by month instead gives about the same catchment needs for the present-day run and Climate Future 1 but a larger need for Climate Future 2 at `r int(dem_gpd)` gallons a day (`r num(need[CF == "present_monthly" & gpd == dem_gpd]$acres_100, 1)`, `r num(need[CF == "cf1_monthly" & gpd == dem_gpd]$acres_100, 1)` and `r num(need[CF == "cf2_monthly" & gpd == dem_gpd]$acres_100, 1)` acres for the present-day run and the two futures, vs. `r num(need[CF == "present" & gpd == dem_gpd]$acres_100, 1)`, `r num(need[CF == "cf1" & gpd == dem_gpd]$acres_100, 1)` and `r num(need[CF == "cf2" & gpd == dem_gpd]$acres_100, 1)`).
+
+**Tank model.** A daily yield-after-spillage model (Fewkes and Butler, 2000; Mitchell, 2007) starts with full storage; each day the tanks supply the smaller of demand and what they hold, then take in the day's catch up to capacity. Rain on the catchment is converted to gallons with a collection efficiency of `r C_eff` {{ASSUMPTION}}. Each corrected run's daily rain for Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)` goes through the model as it is, so each future carries the model's own changes in rain days, dry spells and timing. As a check, observed rain on the same days goes through the same model (`r fref("need")`, dashed line).
+
+**Strengths.**
+
+- The physical model simulates the trade-wind inversion and windward-leeward contrast that control rain at the Summit (Zhang et al., 2016). After correction, its longest dry-season dry spell and heavy-rain days are `r num(hr_bias[m == "cdd_dry"]$ratio, 2)` and `r num(hr_bias[m == "heavy"]$ratio, 2)` times observed at the Summit (`r tref("hrcm")`).
+- The tank model runs on the model's own simulated days, so each future's changes in rain days, dry spells, monthly timing and storms reach the tanks, not only its change in totals.
+- The three runs replay the same weather years, so each future is compared with the present day year by year, with the year-to-year weather held the same.
+- Everything is computed from public data and reruns from this file; assumptions are parameters.
+
+**Weaknesses.**
+
+- **Two futures, both from one model.** Each future is a single run driven by the average of 12 global models (Wang, 2017), so the range across climate models is not shown, and both futures are for 2080-2099 (NPS, 2023).
+- **Same weather years.** The future runs replay 1990-2009 weather in a warmer climate, so changes in El Niño or in the sequence of wet and dry years cannot appear (Zhang et al., 2016).
+- **`r length(hr_wys)` years, ending in `r max(hr_wys)`.** The runs cover Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)` only, so droughts since then are not in them.
+- **The model's droughts are milder than the real ones.** Its daily rain follows the real weather only loosely (correlation `r num(hr_skill$r_day, 2)` day by day, `r num(hr_skill$r_wy, 2)` water year by water year), and its driest three Hawaiʻi water years in a row bring `r int(hr_skill$min3_model / 25.4)` inches against `r int(hr_skill$min3_obs / 25.4)` observed. Over the same years, observed rain needs `r num(need[CF == "observed" & gpd == dem_gpd]$acres_100, 1)` acres to supply `r int(dem_gpd)` gallons a day, the present-day run `r num(need[CF == "present" & gpd == dem_gpd]$acres_100, 1)`. The model's acres are therefore low; the change between runs is the more reliable result.
+- **The correction fixes amounts only.** After correction the present-day run still has `r num(100 * (1 - hr_bias[m == "rain_days"]$ratio), 0)`% too few rain days, `r num(100 * (hr_bias[m == "sdii"]$ratio - 1), 0)`% too much rain per rain day, and the model's errors in timing within each season (`r fref("monthly")`a).
+- **Unknown system.** The catchment's area and the system's water use are not documented; both are placeholders.
+- **What the tank model leaves out.** Overflow and losses in intense rain, evaporation from the tanks, treatment and distribution losses, and the second source and timing of the visitor center haul.
+
+**Code: data, analysis and figures.**
+
+```{r code-processing, ref.label = c("proc-download", "proc-systems", "proc-observed", "proc-gauges", "proc-hrcm", "proc-futures", "proc-demand", "proc-tank", "proc-storms", "proc-figures", "proc-tables"), eval = FALSE, echo = TRUE}
+```

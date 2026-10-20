@@ -1,0 +1,13 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+hi_datasets/
+*.part
+Rplots*.pdf
+figure/
+archive/hi_datasets/
+data
+docs
+**/.DS_Store

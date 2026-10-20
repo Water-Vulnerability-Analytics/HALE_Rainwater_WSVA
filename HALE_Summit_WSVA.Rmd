@@ -1,0 +1,478 @@
+---
+title: "Haleakalā National Park Water Supply Vulnerability Assessment"
+author: ""
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    code_folding: hide
+    self_contained: true
+    fig_caption: true
+    theme: flatly
+---
+
+<!--
+Knitting this file reproduces the whole report. All data compilation, analysis and
+figures are in HALE_Summit_WSVA_Processing.Rmd, knit first as a child; its appendix is
+printed at the end. Assumptions are set at the top of the constants chunk and are marked
+{{ASSUMPTION}} in the text. Reusable functions are in hi_src/ and src/; data are cached in hi_datasets/.
+-->
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, dpi = 150, fig.align = "center")
+```
+
+```{css, echo = FALSE}
+/* Climate-future colours, as in the figures (NPS climate-futures scripts) */
+.cf1 { color: #9A9EE5; font-weight: 600; }
+.cf2 { color: #E10720; font-weight: 600; }
+```
+
+```{r constants, include = FALSE}
+source("setup.R")
+# ---- Settings and assumptions ----------------------------------------------------------
+park <- "HALE"
+C_eff <- 0.8               # {{ASSUMPTION}} share of rain on the catchment that reaches the tanks
+dem_gpd <- 5000            # {{ASSUMPTION}} constant demand, gallons per day (no metered data)
+catchment_acres <- NA      # {{ASSUMPTION}} NA = just large enough for dem_gpd in the present-day run
+demand_end <- 2025         # last calendar year of visitation data
+rerun_downloads <- FALSE   # TRUE: re-download every input (an hour or more); FALSE: read saved copies
+wet_months <- c(11L, 12L, 1:4)                 # Hawaiʻi wet season, Nov-Apr
+days_in_month <- c(31, 28.25, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+gal_per_liter <- 0.264172
+m2_per_acre <- 4046.856
+options(hi.fig_dir = file.path("data", "park", park, "Figs"))
+theme_cf <- theme_bw(base_size = 9) +
+  theme(strip.background = element_rect(fill = "gray95"), strip.text = element_text(colour = "black", face = "bold"),
+        legend.position = "bottom")
+fig_ids <- c("map", "trend", "shadow", "hrcm", "hrcm_ts", "monthly", "visits", "storage", "need", "storms")
+tab_ids <- c("bluf", "trend", "hrcm")
+fref <- function(id) paste("Figure", match(id, fig_ids))
+tref <- function(id) paste("Table", match(id, tab_ids))
+fcap <- function(id, text) paste0(fref(id), ": ", text)
+tcap <- function(id, text) paste0(tref(id), ": ", text)
+assume <- function(x) paste0("{{ASSUMPTION: ", x, "}}")
+figs <- list(); tabs <- list()
+```
+
+```{r run-processing, include = FALSE}
+processing_md <- knitr::knit_child("HALE_Summit_WSVA_Processing.Rmd", envir = knitr::knit_global(), quiet = TRUE)
+```
+
+```{r values, include = FALSE}
+H <- function(x, y, what = "pct") hr_chg[hr_chg$cf == x & hr_chg$m == y][[what]]
+B <- function(y, what = "ratio_raw") hr_bias[hr_bias$m == y][[what]]
+Tr <- function(x, y, what = "pct_dec") { r <- g_trend[g_trend$site == x & g_trend$index == y][[what]]; stopifnot(length(r) == 1); r }
+pfmt <- function(p) ifelse(p < 0.01, "p < 0.01", paste("p =", num(p, 2)))
+SD <- function(x) short_sum[short_sum$CF == x]
+short_wy <- function(x) sort(unique(low[CF == x & short > 0]$run_year))   # years of the run (1-19)
+need_at <- function(x, g = dem_gpd) need[need$CF == x & need$gpd == g]$acres_100
+need_pct <- function(x, g = dem_gpd) 100 * (need_at(x, g) / need_at("present", g) - 1)
+sh_share <- function(x, m) 100 * sum(short_mon[CF == x & month %in% m]$N) / SD(x)$short_days
+mar_jun <- 100 * (1 - mon_fac[month %in% 3:6]$fac)
+nov_up <- function(x) 100 * (mon_fac[run == x & month == 11]$fac - 1)
+# Significance statements written into the text below
+stopifnot(H("cf1", "ann", "p") >= 0.05, H("cf2", "ann", "p") >= 0.05, H("cf1", "dry_mm", "p") < 0.05, H("cf2", "dry_mm", "p") < 0.05,
+          H("cf1", "cdd_dry", "p") >= 0.05, H("cf2", "cdd_dry", "p") < 0.05, H("cf1", "wet_spell", "p") >= 0.05, H("cf2", "wet_spell", "p") < 0.05,
+          all(hr_chg[m %in% c("heavy", "rx1", "hmax")]$p >= 0.05), all(mon_fac[month %in% 3:6]$fac < 1), all(mon_fac[month == 11]$fac > 1))
+rs_roll <- rs[order(water_year)][, roll := data.table::frollmean(annual_mm, 10, align = "center")]
+roll_max <- rs_roll[which.max(roll)]; roll_min <- rs_roll[which.min(roll)]
+hq_km <- as.numeric(sf::st_distance(summit_pt, sf::st_sfc(sf::st_point(c(hq_vc$FacilityLongitude, hq_vc$FacilityLatitude)), crs = 4326))) / 1000
+wet_max_in <- max(terra::values(mean_r), na.rm = TRUE) / 25.4
+storage_days <- summit_storage / dem_gpd
+hc_lab <- "HCDP map, Summit District"
+kula_lab <- gauge_use[["USC00515000"]]
+mon_in <- function(h, m) rs_mon[rs_mon$half == h & rs_mon$month == m]$mm / 25.4
+djf <- function(h) sum(rs_mon[rs_mon$half == h & rs_mon$month %in% c(12, 1, 2)]$mm) / 25.4
+# months named as wetter in the second half (Figure 2b); all others are drier
+stopifnot(identical(which(sapply(1:12, function(i) mon_in("late", i) > mon_in("early", i))), c(3L, 6L, 7L, 9L, 10L)))
+FD <- function(r, col) fire_dry[fire_dry$run == r][[col]]
+EN <- function(ph) iso_enso[iso_enso$enso == ph]$km2
+PDO_neg_since <- { x <- climate_wy[!is.na(phase) & wy <= max(iso_wy)][order(wy)]; r <- rle(x$phase == "Negative PDO"); n <- length(r$values); if (r$values[n]) x$wy[nrow(x) - r$lengths[n] + 1] else NA }
+RF <- function(f) res_fy[res_fy$fac == f]
+WC <- function(x, y, what = "pct") { r <- wind_chg[wind_chg$cf == x & wind_chg$m == y][[what]]; stopifnot(length(r) == 1); r }
+AN <- function(nm) { n <- alert_n[alert_n$name == nm]$N; if (length(n)) n else 0L }
+mph <- function(kt) kt * 1.15078
+hw <- summit_ev[event_type == "High Wind"]
+obs_rank <- function(d) which(obs[!is.na(pr)][order(-pr)]$date == as.Date(d))
+kona26 <- maui_2026[date == as.Date("2026-03-13") & event_type == "Flash Flood"]
+fmon <- function(d) paste(month.name[as.integer(format(d, "%m"))], format(d, "%Y"))
+YW <- function(f, m) merge(hr_wy[run == "present", c("wy", m), with = FALSE], hr_wy[run == f, c("wy", m), with = FALSE], by = "wy")
+YB <- function(f, m, above = FALSE) { d <- YW(f, m); sum(if (above) d[[3]] > d[[2]] else d[[3]] < d[[2]]) }
+YC <- function(f) { d <- YW(f, "ann"); stats::cor(d[[2]], d[[3]]) }
+# More statements written into the text below
+stopifnot(pa_has("Water at Hosmer Grove is temporarily out of service"), pa_has("emergency waterline repair"),
+          pa_has("As of September 30, 2025, water at Hosmer Campground"), pa_has("water infrastructure project"),
+          pa_has("H.lua Visitor Cabin is critically low"), pa_has("extremely dry summer season"),
+          pa_has("reclosed by Maui County for continued firefighting"), pa_has("Fire Ban in Hosmer Campground"),
+          pa_has("fallen trees and rocks"), pa_has("Hurricane Douglas"), pa_has("communication infrastructure has been damaged by the storm"),
+          pa_has("closed beginning at 3 am HST on 1/12/2024 due to high winds"), pa_has("CLOSED due to Severe Weather 2/1/2025"),
+          pa_has("temporarily closed due to winter weather conditions effective February 3, 2021"),
+          all(wind_chg$p >= 0.05), year(obs_top$date[1:5]) >= 2025, nrow(kona26) == 1,
+          EN("El Niño") < EN("La Niña"), EN("El Niño") < EN("Neutral"), !is.na(PDO_neg_since),
+          res_stat$hos_full > 50, RF("sunrise")[which.min(reservations)]$fy == 2021, max(res_mon$share) < 12,
+          Tr(rs_lab, "wet_days", "p") < 0.05, Tr(rs_lab, "wet_season_mm", "p") >= 0.05, Tr(rs_lab, "cdd_dry_season", "p") >= 0.05,
+          all(g_trend[site == kula_lab]$p >= 0.05), iso_trend$p < 0.05, iso_sens[mm == 3000]$p < 0.05, iso_sens[mm == 1000]$p >= 0.05,
+          FD("present", "p30") < FD("cf1", "p30"), FD("cf1", "p30") < FD("cf2", "p30"))
+```
+
+# Bottom line up front
+
+**Can the Summit District's rain catchment meet the park's needs as it is?** Probably not in either climate future, unless its catchment is already much larger than it needs to be today.
+
+**How this was tested.** The system catches rain on a collecting surface (the *catchment*) and stores it in tanks that hold `r int(summit_storage)` gallons, about `r int(storage_days)` days of water if the park uses `r int(dem_gpd)` gallons a day `r assume("demand")`. Nobody has recorded how large the catchment is or how much water the park uses. So this report assumes the park uses `r int(dem_gpd)` gallons a day, and gives the catchment the smallest size that would have kept the tanks from ever running dry in today's climate: `r num(acres, 1)` acres `r assume(paste(num(acres, 1), "acres of catchment"))`. It then runs that same system, day by day, through the rain of the park's two late-century climate futures, simulated by a regional climate model (explained in a later section).
+
+**What happens.** With that catchment and that demand, the tanks run empty:
+
+- **<span class="cf1">Climate Future 1 (RCP 4.5)</span>:** on `r SD("cf1")$short_days` days, spread over `r SD("cf1")$years_short` of the `r length(hr_wys)` years modeled (about `r int(SD("cf1")$short_yr)` days a year on average).
+- **<span class="cf2">Climate Future 2 (RCP 8.5)</span>:** on `r SD("cf2")$short_days` days, spread over `r SD("cf2")$years_short` of the `r length(hr_wys)` years (about `r int(SD("cf2")$short_yr)` days a year).
+
+Most of these empty days (`r num(sh_share("cf1", c(8:12, 1:2)), 0)`% and `r num(sh_share("cf2", c(8:12, 1:2)), 0)`%) fall between August and February: the tanks run down through the dry season and stay low into the early wet season. To keep the tanks from ever running dry, the catchment would need to be `r num(need_pct("cf1"), 0)`% (<span class="cf1">Climate Future 1</span>) to `r num(need_pct("cf2"), 0)`% (<span class="cf2">Climate Future 2</span>) larger, or the park would need to use less water. The park already describes its water supply as running at a deficit and has proposed enlarging the catchment by 15% (NPS, 2024).
+
+- **Rain is already declining.** At the park's own gauge in the Summit District, the 10-year average fell from `r int(roll_max$roll / 25.4)` inches a year around `r roll_max$water_year` to `r int(roll_min$roll / 25.4)` inches around `r roll_min$water_year`, and the gauge records `r num(abs(Tr(rs_lab, "wet_days")), 0)`% fewer rain days per decade (`r pfmt(Tr(rs_lab, "wet_days", "p"))`). Across the park, the area receiving at least 79 inches a year shrank from `r int(iso_trend$first)` km² in `r iso_per$lab[1]` to `r int(iso_trend$last)` km² in `r iso_per$lab[n_per]`: the rain shadow is widening.
+- **Both climate futures are drier at the Summit, mostly in the dry season.** By the late century (2080-2099), the regional climate model projects `r num(abs(H("cf1", "ann")), 0)`% (<span class="cf1">Climate Future 1</span>) and `r num(abs(H("cf2", "ann")), 0)`% (<span class="cf2">Climate Future 2</span>) less annual rain, with dry-season rain down `r num(abs(H("cf1", "dry_mm")), 0)`% and `r num(abs(H("cf2", "dry_mm")), 0)`%, `r num(abs(H("cf1", "rain_days")), 0)`-`r num(abs(H("cf2", "rain_days")), 0)`% fewer rain days, and longest dry-season dry spells `r num(H("cf1", "cdd_dry"), 0)`% and `r num(H("cf2", "cdd_dry"), 0)`% longer. Because the tank model runs on the climate model's own day-by-day rain, these changes in timing and dry spells are built into the results above.
+- **Storms are already a threat.** Park staff report that a storm in 2026 destroyed about 60% of the catchment, which is being rebuilt to withstand storms (Haleakalā National Park staff, personal communication, 2026). The climate model shows little change in the same storms' winds at the catchment, but it cannot show whether storms become more common; research expects more tropical cyclones near Hawaiʻi (Murakami et al., 2013).
+- **Longer dry spells bring two more threats.** Years with a dry spell of 30 days or more, long enough for grasses to carry large fires (NPS, 2024), rise from `r int(FD("present", "p30"))`% of years today to `r int(FD("cf1", "p30"))`% and `r int(FD("cf2", "p30"))`% in the futures. Long dry spells also let dust, droppings and smoke ash build up on the catchment between rains, to wash into the tanks with the next storm (Macomber, 2020).
+- **The answer turns on two numbers the park does not yet record:** the catchment's area and the system's water use. With them, `r fref("need")` shows how much more catchment each future needs. Read it for how much the need grows, not for the exact acres: the climate model's multi-year droughts are milder than the real ones, so it understates the acres needed (`r num(need_at("observed"), 1)` acres for observed `r min(hr_wys)`-`r max(hr_wys)` rain vs. `r num(need_at("present"), 1)` for the present-day run).
+
+```{r tab-bluf}
+knitr::kable(tabs$bluf, align = "lrrr", escape = FALSE,
+  caption = tcap("bluf", paste0("Summit District rain and supply in the regional climate model's present-day run and two late-century climate futures, all replaying the weather of Hawaiʻi water years ", min(hr_wys), "-", max(hr_wys), ". Rain values are averages per year. The model's rain is corrected season by season so that the present-day run's rain equals the observed average. Percentages: change from the present-day run. Supply: ", int(dem_gpd), " gallons a day from ", int(summit_storage), " gallons of storage and ", num(acres, 1), " acres of catchment ", assume("demand and catchment"), ".")))
+```
+
+**What this report covers.** The NPS Water Supply Database (WSD) lists six water systems in the park. Five are small: three wilderness cabin systems in the crater, the Kīpahulu well, and the summit visitor center's tank, which is filled with water hauled from the main system. This report assesses only the largest, the Summit District system, the park's main public water supply, and only the effects of rain and climate on it.
+
+# Haleakalā National Park
+
+Haleakalā National Park (HALE) protects the summit and eastern flank of Haleakalā, the volcano that forms East Maui (`r fref("map")`). Upper Haleakalā became part of Hawaiʻi National Park in 1916 and a national park of its own in 1961. It covers 13,444 hectares (about 33,200 acres), of which 10,003 hectares are designated wilderness (Longman et al., 2015b). The park runs from the 10,023-ft summit down to sea level, so within a few miles the land changes from alpine shrubland and bare cinder to dry forest and tropical rainforest (Longman et al., 2015b). More than 90% of the park's native plants and animals live only in the Hawaiian Islands, and nearly half live only on Maui (Longman et al., 2015b); the Haleakalā silversword, found in the alpine zone, is the best known (Longman et al., 2015b; NPS, 2024).
+
+The park has three parts:
+
+- **The Summit District**, on the volcano's northwest slope along Crater Road, is where most visitors go. It holds park headquarters, staff housing, Hosmer Grove Campground, the summit visitor center and the trailheads into the summit depression ("crater"), a wilderness with three backcountry cabins. All of its developed areas draw on one rain-fed water system, the subject of this report.
+- **The Kīpahulu District**, on the wet eastern coast, includes the Kīpahulu Visitor Center, the ʻOheʻo area and the Pīpīwai Trail (NPS, 2024). It has its own water from a well.
+- **The Nuʻu Section**, a 4,100-acre parcel bought in 2008, runs from the crater's southern rim to the coast near Nuʻu Bay. It is closed to the public while the park fences out feral animals and restores native plants (NPS, 2024).
+
+# Climate: trade winds, a lid of warm air and a rain shadow
+
+**Where the rain comes from.** Most of the time, steady northeast trade winds blow moist air off the ocean onto Maui. When that air is pushed up Haleakalā's windward (northeast-facing) slopes, it cools, and cool air cannot hold as much water vapor, so clouds form and rain falls (Longman et al., 2015b). This makes the windward slopes some of the wettest places on Earth: Big Bog, on Haleakalā's windward side, averaged about 10,300 mm (400 inches) of rain a year, slightly more than famously wet Mount Waiʻaleʻale on Kauaʻi (Longman et al., 2015b).
+
+**A lid on the clouds.** A layer of warm, dry air usually sits over the islands like a lid, the *trade-wind inversion*. Normally air gets colder as you go up; in this layer it gets warmer instead, which stops the clouds from growing taller. Its base averages about 6,800-7,300 ft but can sit anywhere between about 3,100 and 13,800 ft (Cao et al., 2007; Longman et al., 2015b). Below it, the windward slopes are cloudy and wet; above it, the air is dry and sunny, and the top of the cloud forest follows the lid's usual height (Longman et al., 2015b). Haleakalā's upper slopes rise above the lid, so the trade winds are pushed around the mountain rather than over it, and the clouds that build on the windward side do not reach the leeward side under normal trade winds (Longman et al., 2015b). The Summit District, at about 7,000 ft, sits near the lid's average height.
+
+**The rain shadow.** Because the moist trade-wind air goes around the summit instead of over it, the summit, the crater and the leeward (southwest-facing) slopes sit in the mountain's *rain shadow* (`r fref("map")`). A rain shadow is not rainless; it gets less rain, from different weather. During the day, a sea breeze pushes air up the leeward slopes and builds a band of clouds between about 4,000 and 5,900 ft, but these clouds rarely produce steady showers. Most of the leeward side's rain comes in winter, when storms interrupt the trade winds: frontal systems, upper-level troughs and Kona storms (Longman et al., 2015b). Average annual rain over 1991-2025 ranges from about `r int(wet_max_in)` inches on the park's windward slopes to about `r int(summit_mean_in)` inches at the Summit District. The park's climate assessment expects the warming to hit the high elevations hardest, leaving the summit and upper Kīpahulu Valley drier than they are now (NPS, 2024).
+
+**Wet and dry seasons, and the Hawaiʻi water year.** Hawaiʻi has two seasons: a wet season from November to April and a dry season from May to October (Longman et al., 2015b). Most of the Summit's rain falls in the wet season (`r fref("monthly")`a). This report therefore counts years as **Hawaiʻi water years**, which run from November through October and are named for the year they end in: Hawaiʻi water year 2025 runs from November 2024 to October 2025. That way each year holds one whole wet season followed by the dry season that the tanks must get through on what they caught.
+
+**Wet years and dry years.** Rain also swings strongly from one year to the next, mostly with El Niño and La Niña, the warming and cooling of the tropical Pacific Ocean. Winters during El Niño tend to be dry in Hawaiʻi (Chu and Chen, 2005; Frazier et al., 2018).
+
+# The Summit District water system
+
+**What it serves.** A community water system (public water system HI0000222) serving about 1,200 people through 17 service connections (U.S. EPA, 2026a): park headquarters, government quarters, Hosmer Grove Campground (`r hosmer_cap$sites` tent sites for up to `r hosmer_cap$people` people), the entrance station and the maintenance and resource management areas (`r fref("map")`). A trailer hauls about 2,000 gallons of its treated water each week (about `r int(ut21_gpd)` gallons a day) up Crater Road to the Haleakalā Visitor Center, about half a mile from the summit, which has no other drinking water (WSD system UT-21). In the dry season, non-potable water from a 100,000-gallon tank is also hauled to the visitor center for its flush toilets (NPS, 2024).
+
+**Where it is.** The WSD places the system's rain catchment near Hosmer Grove and the cinder cone Puʻunianiau (OpenStreetMap contributors, 2026), at about `r int(sset("HALE_WS_001", "elev_ft"))` ft, about `r num(hq_km, 1)` km north of the Park Headquarters Visitor Center on Crater Road (the WSD rates this location's confidence as low). The ground is `r sset("HALE_WS_001", "geo_name")` (`r sset("HALE_WS_001", "geo_rock")`), in a `r tolower(sset("HALE_WS_001", "moisture_zone"))` moisture zone mapped as `r tolower(sset("HALE_WS_001", "land_cover"))` land, in the `r sset("HALE_WS_001", "watershed")` watershed.
+
+**How water moves.** Rain from the catchment flows by gravity to two 250,000-gallon welded-steel raw-water tanks, then through two slow sand filters and a hypochlorinator into a 50,000-gallon buried treated-water tank, and on to the distribution pipes (WSD). The WSD lists `r int(summit_storage)` gallons of storage in all. Almost all of the drinking-water pipes are buried; the non-potable lines run above ground (NPS, 2024). Hosmer Grove also has two historic redwood storage tanks, which the park plans to line (NPS, 2024). **Neither the catchment's surface nor its area is documented, and the system's water use is not recorded.**
+
+**A supply already under strain.** The park's 2024 climate vulnerability assessment describes all of its summit and crater rain catchments as "already deemed inadequate", the park as "already in deficit operation", and notes that in long dry seasons the park has had to truck in water from outside the park (NPS, 2024). At the other extreme, the tanks overflow two to three times a year in heavy rain, water the park would like to capture. The park has proposed enlarging the catchment by 15%, with room to expand later, and adding a 50,000-gallon raw-water tank (NPS, 2024).
+
+**Outages downstream of the tanks.** The park's own alerts show that the pipes fail too. Water at Hosmer Grove Campground was out of service from late February to mid-March 2023 and shut off for an emergency waterline repair in July 2024. A waterline break on September 30, 2025 shut it off again, and that outage was still posted in `r format(pa_last_seen, "%B %Y")`, the last month in the alert record; campers were sent to the Headquarters Visitor Center for water (NPS, 2026). In January 2026 the park began a water infrastructure project at the Haleakalā Visitor Center, expected to last several months (NPS, 2026).
+
+**A rare and historic system.** It is one of only four public water systems in Hawaiʻi, regulated by the Department of Health, that draw their water from rain catchment; the others are at Hawaiʻi Volcanoes National Park, Kīlauea Military Camp and Kūlani Correctional Facility (Hawaiʻi DOH, 2014). The WSD names it the park's "Historic Water System", and the park archives hold its 1939 blueprints (Finnigan, 2023b). Rain catchment is also part of everyday life in rural Hawaiʻi beyond the park: an estimated 30,000 to 60,000 people in the state depend on it, mostly in the Puna, Kaʻū and Hāmākua districts of Hawaiʻi Island (Macomber, 2020), where most surveyed rural residents use catchment water for drinking or bathing (Donohue et al., 2017).
+
+```{r fig-map, fig.width = figs$map$w, fig.height = figs$map$h, fig.cap = fcap("map", "The Summit District water system, two of the places that use its water (arrows; water reaches the Haleakalā Visitor Center by a weekly truck haul), and the two rain gauges used in this report, over mean annual rain from the HCDP rain maps and the park boundary. Inset: Haleakalā National Park on Maui.")}
+figs$map$p
+```
+
+# Rain is already changing
+
+**Two kinds of rain records.** This section uses two sources. The first is rain gauges: the park's own gauge at the Haleakalā Ranger Station (the *Summit District gauge*), at `r int(gauge_meta[id == "USC00511004"]$elevation * 3.28084)` ft (NOAA's GHCN-Daily network; Menne et al., 2012), and, for comparison, a lower gauge at the Kula Branch Station (the *Kula gauge*), `r int(gauge_meta[id == "USC00515000"]$elevation * 3.28084)` ft, `r int(gauge_meta[id == "USC00515000"]$dist_to_park_km)` km west of the park, for comparison (`r fref("map")`). A gauge measures rain at one spot, day after day; the Summit gauge has complete Hawaiʻi water years from `r min(rs$water_year)` to `r max(rs$water_year)`, with gaps after that. The second is the *HCDP rain maps* from the Hawaiʻi Climate Data Portal. For every day since 1990, the HCDP estimates rain on a grid of 250-m (about 820-ft) squares covering the islands. It starts from the gauges that reported that day and fills in the places between them, using each place's long-term rain pattern as a guide (Longman et al., 2019). This report averages the nine squares around the catchment. The HCDP rain maps cover the recent years the Summit District gauge misses, but between gauges they are estimates. They are reliable for how much rain fell, but not for counting rain days or dry spells, because filling in between gauges smooths out the dry days at any one spot.
+
+**How trends are measured.** For each record, this report uses Sen's slope, the typical change from year to year, which a few unusually wet or dry years cannot throw off (Sen, 1968). The Mann-Kendall test then asks whether the values tend to rise or fall over time; a result marked significant (p < 0.05) would arise by chance less than 1 time in 20 (Mann, 1945; Kendall, 1970). A *rain day* is a day with at least 0.04 inch (1 mm) of rain; a *dry spell* is a run of days with less.
+
+**Less rain, fewer rain days.** At the Summit District gauge, the 10-year average peaked at `r int(roll_max$roll / 25.4)` inches a year around `r roll_max$water_year` and fell to `r int(roll_min$roll / 25.4)` inches around `r roll_min$water_year` (`r fref("trend")`a). The HCDP rain maps continue the decline to the present at the same spot. They rise and fall with the gauge from year to year (correlation `r num(ov_r, 2)`, where 1 would be a perfect match), though they read lower in absolute terms. Over the gauge's full record, rain days fell `r num(abs(Tr(rs_lab, "wet_days")), 1)`% per decade (significant; `r pfmt(Tr(rs_lab, "wet_days", "p"))`), and wet-season rain fell `r num(abs(Tr(rs_lab, "wet_season_mm")), 1)`% per decade, a decline too variable to be significant (`r pfmt(Tr(rs_lab, "wet_season_mm", "p"))`; `r tref("trend")`). The Kula gauge, lower on the mountain, shows no significant change, which fits a decline concentrated at high elevations.
+
+**The wider record agrees.** Most of the Haleakalā crater has dried significantly since 1920 (Frazier and Giambelluca, 2017). Rain at high elevations across Hawaiʻi has declined since the early 1990s, as the trade-wind inversion has become more frequent (Longman et al., 2015a). At Haleakalā's high-elevation climate stations, dry-season rain fell 5-8% per decade from about 1988 to 2013, while days with no rain rose 4-5% per decade (Longman et al., 2015b). Statewide, Hawaiʻi has been drying since the 1950s (Frazier et al., 2023).
+
+**Less rain in mid-winter.** The decline is concentrated in the heart of the wet season. Comparing the gauge's first and second 30 years, average December-February rain fell from `r num(djf("early"), 1)` to `r num(djf("late"), 1)` inches, while March, June-July and the late dry season (September-October) became wetter (`r fref("trend")`b).
+
+**Dry spells.** The longest dry-season dry spell at the gauge shows no significant trend over `r min(rs$water_year)`-`r max(rs$water_year)` (`r pfmt(Tr(rs_lab, "cdd_dry_season", "p"))`), although its 10-year average rose in the 2000s (`r fref("trend")`d). Recent dry seasons have already dried up water sources in the crater. In June 2024 the park warned that water at the Hōlua visitor cabin was "critically low", and in August 2025 that there was no water at all in the Hōlua area, "the result of an extremely dry summer season" (NPS, 2026). Those cabins have their own small systems, not this one, but the alerts show how quickly a dry summer empties a rain- and spring-fed supply.
+
+```{r fig-trend, fig.width = figs$trend$w, fig.height = figs$trend$h, fig.cap = fcap("trend", "Rain at the Summit District since 1951: how much (a), when (b), how often (c) and the longest dry spell (d). Grey lines join the individual years; coloured lines are 10-year averages. Shaded in (b): dry season (May-October).")}
+figs$trend$p
+```
+
+```{r tab-trend}
+knitr::kable(tabs$trend, align = "lrrr", caption = tcap("trend", "Change per decade in each record, as a share of its average (Sen's slope). * Significant (Mann-Kendall p < 0.05). —: not counted from the HCDP rain maps, which smooth out dry days."))
+```
+
+**The rain shadow is widening.** No standard rain amount marks the edge of a rain shadow, and no published threshold for Haleakalā was found. This report uses the line where 79 inches (2,000 mm) of rain falls a year, which crosses the park between its wet windward slopes and the dry summit `r assume("2,000 mm marks the edge of the rain shadow")`. Drawing that line from the HCDP rain maps for each year since `r min(iso_wy)` shows it pulling back east, toward the windward slopes, over time (`r fref("shadow")`a). The park area receiving at least 79 inches fell from `r int(iso_trend$first)` km² in Hawaiʻi water years `r iso_per$lab[1]` to `r int(iso_trend$last)` km² in `r iso_per$lab[n_per]` (of `r int(grid_km2)` km² mapped), a decline of `r num(abs(iso_trend$sen), 1)` km² per decade (significant; `r pfmt(iso_trend$p)`; `r fref("shadow")`b). The choice of line matters only somewhat: the area above 3,000 mm (118 inches) shrinks significantly too (`r num(abs(iso_sens[mm == 3000]$sen), 1)` km² per decade; `r pfmt(iso_sens[mm == 3000]$p)`), while the area above 1,000 mm (39 inches) shrinks by a similar amount that is not significant (`r num(abs(iso_sens[mm == 1000]$sen), 1)` km² per decade; `r pfmt(iso_sens[mm == 1000]$p)`). Part of any apparent shift could come from the gauges behind the HCDP rain maps, which are few at high elevations (Thrasher et al., 2026).
+
+The area also swings from year to year with El Niño and La Niña (`r fref("shadow")`b). El Niño years are those whose winter (December-February) tropical Pacific was at least 0.5 °C warmer than normal, by NOAA's Oceanic Niño Index, and La Niña years at least 0.5 °C cooler (NOAA CPC, 2026). The area averaged `r int(EN("El Niño"))` km² in El Niño years, against `r int(EN("La Niña"))` km² in La Niña years and `r int(EN("Neutral"))` km² in neutral years: it is smallest in El Niño years, which fits the dry El Niño winters described earlier (Chu and Chen, 2005). The Pacific Decadal Oscillation (PDO) is a slower pattern of North Pacific sea temperatures that stays in one phase for years to decades (NOAA NCEI, 2026a); its phase has been negative every year since `r PDO_neg_since`.
+
+```{r fig-shadow, fig.width = figs$shadow$w, fig.height = figs$shadow$h, fig.cap = fcap("shadow", paste0("Where the 79-inch (2,000-mm) rain line falls each Hawaiʻi water year, coloured by year (a), and the park area receiving at least that much rain each year, with its trend (dashed) (b). In (b), shading marks El Niño and La Niña years, and the band along the top the phase of the Pacific Decadal Oscillation (NOAA CPC, 2026; NOAA NCEI, 2026a). HCDP rain maps, Hawaiʻi water years ", min(iso_wy), "-", max(iso_wy), "."))}
+figs$shadow$p
+```
+
+**El Niño and the larger patterns.** El Niño and a slower Pacific pattern, the Pacific Decadal Oscillation, cause most of the swings in Hawaiʻi's rain from year to year and decade to decade, and they can hide or exaggerate the long-term trend for decades at a time (Frazier et al., 2023). How they will change is uncertain: scientists do not yet agree on whether El Niño's swings will grow or shrink in a warmer climate (Zhang et al., 2016). Projections for Hawaiʻi also disagree on how much rain will change, and even in which direction, though they point to drier leeward areas (Frazier et al., 2023).
+
+# From regional trends to the Summit District
+
+The gauges and the HCDP rain maps show what has already happened. Looking ahead takes a climate model. The global climate models used for most projections work on squares about 100 km (60 miles) across, far too coarse to see a single mountain, let alone a catchment (Zhang et al., 2016). This report instead uses the Hawaiʻi Regional Climate Model (HRCM; Zhang, 2017), a weather model like the ones behind daily forecasts, run over the islands on a grid of 0.8-km (half-mile) squares and saved hour by hour. At that fine scale it creates the trade winds, the inversion lid and the wet windward and dry leeward sides itself, rather than borrowing them from today's maps (Zhang et al., 2016).
+
+**How the futures were made.** The model was first run for the real weather of 1990-2009; this is the *present-day run*. It was then run again over the same 20 years, with the warming that 12 global climate models project for 2080-2099 added on top (Wang, 2017; NPS, 2023). In effect, each future asks: if the weather of 1990-2009 happened again in a late-century climate, what would the rain at the Summit look like? The two late-century runs are the park's two climate futures (NPS, 2023), each tied to a greenhouse-gas emissions pathway: RCP 4.5, a moderate pathway, and RCP 8.5, a high one (Runyon et al., 2024).
+
+- **<span class="cf1">Climate Future 1 (RCP 4.5)</span>:** moderate warming and a slight decrease in rain.
+- **<span class="cf2">Climate Future 2 (RCP 8.5)</span>:** severe warming and drought.
+
+Because each future replays the same weather, comparing it with the present-day run shows how a warmer world changes the same storms and dry spells: how much rain falls, on how many days, how long dry spells last and how intense storms are. The same design has limits. The futures keep that period's sequence of El Niño years and storm tracks, so changes in those patterns cannot appear (Zhang et al., 2016). And each scenario has only one future, for 2080-2099.
+
+**Correcting the model's rain.** Like most climate models, the HRCM does not get rain amounts exactly right at any one place. At the Summit, its present-day run rains on about the right number of days and has dry spells of about the right length (`r num(B("rain_days"), 2)` and `r num(B("cdd_dry"), 2)` times observed), but it makes `r num(B("ann"), 1)` times too much rain, with about `r num(B("heavy"), 0)` times too many heavy-rain days (`r tref("hrcm")`). Fed straight into a tank model, that extra rain would make the catchment look far more productive than it is. So this report scales the model's rain down to match what was actually observed. Every day's rain is multiplied by one factor for the wet season (`r num(hr_k[wet == TRUE]$k, 2)`) and one for the dry season (`r num(hr_k[wet == FALSE]$k, 2)`), chosen so that the present-day run's average rain equals the observed average for `r min(hr_wys)`-`r max(hr_wys)`. A dry-season day the model gives 1 inch, for example, counts as `r num(hr_k[wet == FALSE]$k, 2)` inch. The same factors are applied to both futures, so each future's change from the present day is kept. So is everything else the model simulates: which days are wet or dry, how long dry spells last, and how rain shifts between months. After correction, the present-day run has `r num(B("heavy", "ratio"), 2)` times the observed heavy-rain days and `r num(B("rain_days", "ratio"), 2)` times the observed rain days. These corrected runs are what the tank model uses.
+
+# Rain at the Summit in the two futures
+
+Both futures bring less rain to the Summit, with the largest losses in the dry season, fewer rain days and longer stretches without rain (`r fref("hrcm")`; `r tref("hrcm")`). Every value below compares a future with the present-day run: the same model, the same weather years, with and without late-century warming. Values are averages per year of the corrected runs. A change is called *significant* when a paired t-test, which compares each future year with the same weather year in the present-day run, finds it unlikely to be chance (p < 0.05); with only `r length(hr_wys)` years, smaller changes often are not.
+
+- **Amount.** Annual rain falls `r num(abs(H("cf1", "ann")), 0)`% (<span class="cf1">Climate Future 1</span>) and `r num(abs(H("cf2", "ann")), 0)`% (<span class="cf2">Climate Future 2</span>), from the present-day run's `r num(H("cf1", "ann", "present") / 25.4, 1)` inches a year to `r num(H("cf1", "ann", "future") / 25.4, 1)` and `r num(H("cf2", "ann", "future") / 25.4, 1)` inches, a change too variable over `r length(hr_wys)` years to be significant. Dry-season rain falls significantly, by `r num(abs(H("cf1", "dry_mm")), 0)`% and `r num(abs(H("cf2", "dry_mm")), 0)`%.
+- **Timing.** The runs move rain out of spring and early summer: March-June rain falls by `r num(min(mar_jun), 0)`-`r num(max(mar_jun), 0)`%, while November rain rises `r num(nov_up("cf1"), 0)`% and `r num(nov_up("cf2"), 0)`% (`r fref("monthly")`b). The park's climate futures show the same November increase at the catchment (NPS, 2024).
+- **Dry days and dry spells.** Rain days fall `r num(abs(H("cf1", "rain_days")), 0)`% and `r num(abs(H("cf2", "rain_days")), 0)`% (`r int(H("cf1", "dry_days", "future") - H("cf1", "dry_days", "present"))` and `r int(H("cf2", "dry_days", "future") - H("cf2", "dry_days", "present"))` more dry days a year), and the longest dry-season dry spell in a typical year grows `r num(H("cf1", "cdd_dry"), 0)`% and `r num(H("cf2", "cdd_dry"), 0)`%, from `r int(H("cf1", "cdd_dry", "present"))` to `r int(H("cf1", "cdd_dry", "future"))` and `r int(H("cf2", "cdd_dry", "future"))` days (significant in <span class="cf2">Climate Future 2</span> only).
+- **Wet spells and storms.** Wet spells shorten slightly (`r num(abs(H("cf1", "wet_spell")), 0)`% and `r num(abs(H("cf2", "wet_spell")), 0)`%, significant in <span class="cf2">Climate Future 2</span> only). Days with at least 1 inch of rain, the wettest day and the largest hourly rain change by amounts too variable to be significant.
+
+```{r fig-hrcm, fig.width = figs$hrcm$w, fig.height = figs$hrcm$h, fig.cap = fcap("hrcm", "Change in the yearly average of each measure at the Summit District in the two climate futures, late century vs. the model's present-day run (same weather years, corrected rain). Pale bars: not significant (paired t-test, p ≥ 0.05).")}
+figs$hrcm$p
+```
+
+Year by year (`r fref("hrcm_ts")`), <span class="cf1">Climate Future 1</span> and <span class="cf2">Climate Future 2</span> have fewer rain days than the present-day run in `r YB("cf1", "rain_days")` and `r YB("cf2", "rain_days")` of the `r length(hr_wys)` years, less dry-season rain in `r YB("cf1", "dry_mm")` and `r YB("cf2", "dry_mm")`, and a longer longest dry-season dry spell in `r YB("cf1", "cdd_dry", above = TRUE)` and `r YB("cf2", "cdd_dry", above = TRUE)`. Because each future replays the same weather years, a wet or dry year in the present-day run tends to be wet or dry in the futures too: their annual rain rises and falls together (correlation `r num(YC("cf1"), 2)` and `r num(YC("cf2"), 2)` across the years). In `r fref("hrcm_ts")` the years are numbered 1 to `r length(hr_wys)`: year 1 is the weather of Hawaiʻi water year `r min(hr_wys)` in the present-day run, and the same weather in a late-century climate in the futures.
+
+```{r fig-hrcm-ts, fig.width = figs$hrcm_ts$w, fig.height = figs$hrcm_ts$h, fig.cap = fcap("hrcm_ts", paste0("The statistics in ", fref("hrcm"), ", year by year, for the present-day run (grey) and the two late-century futures. All three replay the same ", length(hr_wys), " years of weather: year 1 is Hawaiʻi water year ", min(hr_wys), " in the present-day run, and the same weather in a 2080-2099 climate in the futures. Corrected rain."))}
+figs$hrcm_ts$p
+```
+
+```{r fig-monthly, fig.width = figs$monthly$w, fig.height = figs$monthly$h, fig.cap = fcap("monthly", paste0("When rain falls at the Summit District: average monthly rain, observed and in the corrected present-day run, Hawaiʻi water years ", min(hr_wys), "-", max(hr_wys), " (a), and each climate future's change in each month (b). Shaded: dry season. Months run November to October."))}
+figs$monthly$p
+```
+
+```{r tab-hrcm}
+knitr::kable(tabs$hrcm, align = "lrrrr", escape = FALSE, caption = tcap("hrcm", paste0("Change in the yearly average of each measure, late century vs. the HRCM present-day run, corrected rain (Hawaiʻi water years ", min(hr_wys), "-", max(hr_wys), "; * p < 0.05, paired t-test), and how the present-day run compares with observed rain at the same place before and after the correction. '(caution)': still more than 50% off after correction.")))
+```
+
+# Demand
+
+**Visitors.** Recreation visits to the park peaked at about `r num(max(vis_y$visitors) / 1e6, 1)` million in `r vis_y[which.max(visitors)]$Year` and have since declined, with a COVID-19 low in 2020; they averaged `r num(mean(vis_recent$visitors) / 1e6, 2)` million a year in `r min(vis_recent$Year)`-`r max(vis_recent$Year)` (NPS, 2025; `r fref("visits")`). Tent camping, which includes Hosmer Grove, averaged `r sig(mean(vis_y[Year >= 2022]$tent), 2)` camper-nights a year since 2022, up from `r sig(mean(vis_y[Year %in% 2013:2019]$tent), 2)` in 2013-2019. Park-wide visits include Kīpahulu, which this system does not serve.
+
+**Reservations at Hosmer Grove and the summit.** Recreation.gov's historical reservation records (RIDB, 2026) give a closer look at two of the system's users:
+
+- **Hosmer Grove Campground** has taken reservations since `r fmon(res_first[fac == "hosmer"]$first)`. In fiscal years `r min(RF("hosmer")$fy)`-`r max(RF("hosmer")$fy)` it recorded `r int(min(RF("hosmer")$reservations))` to `r int(max(RF("hosmer")$reservations))` reservations (`r int(min(RF("hosmer")$site_nights))` to `r int(max(RF("hosmer")$site_nights))` site-nights, `r fref("visits")`b) a year, with an average of `r num(res_stat$hos_people, 1)` people per reservation. At least `r hosmer_cap$sites` bookings, one for each site, were recorded on `r int(res_stat$hos_full)`% of nights, and bookings were spread evenly across the months: the campground is full almost year-round, so its use is set by its size, not by the season.
+- **Summit sunrise reservations** began in `r fmon(res_first[fac == "sunrise"]$first)`. Reservations fell from `r sig(RF("sunrise")[fy == min(fy)]$reservations, 2)` in fiscal year `r min(RF("sunrise")$fy)` to `r sig(min(RF("sunrise")$reservations), 2)` in `r RF("sunrise")[which.min(reservations)]$fy`, during the COVID-19 pandemic, and have been about `r sig(mean(RF("sunrise")[fy >= max(fy) - 2]$reservations), 2)` a year since `r max(RF("sunrise")$fy) - 2` (median `r int(res_stat$sun_day)` a day), again spread evenly through the year. Sunrise is viewed from the summit area, beside the Haleakalā Visitor Center, whose water is hauled from this system.
+
+Both records include bookings that were later cancelled or changed (the files do not mark them), so they overstate actual use somewhat. Even so, they show that these demands do not ease in the dry season, when the tanks are lowest (`r fref("visits")`).
+
+**Water use.** The park does not record the Summit District system's water use, and no public record of it was found. Its users are year-round (headquarters, housing, maintenance) and seasonal (campers, visitors at headquarters and the summit). This report therefore treats demand as a constant `r int(dem_gpd)` gallons a day `r assume("demand")` and shows the results for `r int(min(gpd_grid))` to `r int(max(gpd_grid))` gallons a day.
+
+**Demand is likely to rise as supply falls.** The park's climate assessment expects water demand to grow in both futures: longer peak visitor seasons, higher temperatures that raise the water needs of people, plants and animals, and more water held for fighting fires (NPS, 2024). A constant demand, as used here, is therefore a best case.
+
+```{r fig-visits, fig.width = figs$visits$w, fig.height = figs$visits$h, fig.cap = fcap("visits", "Recreation visits to Haleakalā National Park each complete calendar year (a; NPS, 2025), and site-nights reserved at Hosmer Grove Campground (b) and summit sunrise reservations (c) in each complete fiscal year (RIDB, 2026). Reservation counts include bookings later cancelled or changed.")}
+figs$visits$p
+```
+
+# Can the storage meet demand?
+
+**How the tank model works.** The tank model is a day-by-day water budget (Fewkes and Butler, 2000; Mitchell, 2007). Each day it takes the day's rain from a climate-model run, turns it into gallons caught by the catchment, and adds them to the tanks; anything above the tanks' capacity overflows and is lost. It then takes out the day's demand. If the tanks hold less than the demand, that day counts as a *shortfall*: demand is not met. The model steps through all `r length(hr_wys)` years of each corrected run in turn: the present-day run and the two futures. Because all three replay the same weather years, a future can be compared with the present day year by year. Assumptions:
+
+- **Storage:** `r int(summit_storage)` gallons (WSD), full at the start.
+- **Catchment:** `r num(acres, 1)` acres `r assume("catchment area; it is not documented. Chosen as the smallest area that meets the assumed demand on every day of the present-day run")`. This is the smallest catchment that would never have run short in today's climate, so any shortfall in the futures comes from the change in climate.
+- **Collection efficiency:** `r C_eff * 100`% of the rain reaches the tanks `r assume("collection efficiency")`.
+- **Demand:** `r int(dem_gpd)` gallons a day, every day `r assume("demand; not metered")`.
+
+**Results.** Because the catchment was sized to it, the tanks never run dry in the present-day run, though they fall to `r num(min(low[CF == "present"]$low), 0)`% full in year `r low[CF == "present"][which.min(low)]$run_year` (the weather of Hawaiʻi water year `r low[CF == "present"][which.min(low)]$wy`). In both futures they run dry (`r fref("storage")`; years numbered as in `r fref("hrcm_ts")`):
+
+- **<span class="cf1">Climate Future 1 (RCP 4.5)</span>:** demand is not met on `r SD("cf1")$short_days` days, in `r SD("cf1")$years_short` of the `r length(hr_wys)` years (years `r paste(short_wy("cf1"), collapse = ", ")`); the longest run of empty days lasts `r SD("cf1")$longest` days.
+- **<span class="cf2">Climate Future 2 (RCP 8.5)</span>:** `r SD("cf2")$short_days` days, in `r SD("cf2")$years_short` years (years `r paste(short_wy("cf2"), collapse = ", ")`); the longest lasts `r SD("cf2")$longest` days.
+
+Most shortfall days (`r num(sh_share("cf1", c(8:12, 1:2)), 0)`% and `r num(sh_share("cf2", c(8:12, 1:2)), 0)`%) fall between August and February: the tanks empty late in the dry season and stay low into the wet season.
+
+```{r fig-storage, fig.width = figs$storage$w, fig.height = figs$storage$h, fig.cap = fcap("storage", paste0("Lowest level the tanks reach in each year of the model runs, for ", int(dem_gpd), " gallons a day from ", num(acres, 1), " acres of catchment ", assume("demand and catchment"), ". All three runs replay the same weather years (year 1 = Hawaiʻi water year ", min(hr_wys), "). Crosses: years the tanks run dry."))}
+figs$storage$p
+```
+
+**How much catchment is needed?** The same model can be turned around to ask how large a catchment would never run short. To meet `r int(dem_gpd)` gallons a day on every day, the catchment needed rises from `r num(need_at("present"), 1)` acres in the present-day run to `r num(need_at("cf1"), 1)` acres in <span class="cf1">Climate Future 1</span> (`r pc(need_pct("cf1"), 0)`) and `r num(need_at("cf2"), 1)` acres in <span class="cf2">Climate Future 2</span> (`r pc(need_pct("cf2"), 0)`). For `r int(3000)` gallons a day, it rises from `r num(need_at("present", 3000), 1)` acres to `r num(need_at("cf1", 3000), 1)` and `r num(need_at("cf2", 3000), 1)` acres (`r fref("need")`). The park's proposed 15% larger catchment (NPS, 2024) would cover only part of these increases.
+
+These acres are low in absolute terms. The model's multi-year droughts are milder than the real ones: over the same years, observed rain needs `r num(need_at("observed"), 1)` acres to supply `r int(dem_gpd)` gallons a day, against `r num(need_at("present"), 1)` acres for the present-day run (`r fref("need")`, dashed line; Appendix A). The changes between runs, not the acres, are the result to use.
+
+```{r fig-need, fig.width = figs$need$w, fig.height = figs$need$h, fig.cap = fcap("need", paste0("Catchment needed for the Summit District's ", int(summit_storage), " gallons of storage to meet a constant demand on every day of Hawaiʻi water years ", min(hr_wys), "-", max(hr_wys), ", in the corrected present-day run and the two climate futures (collection efficiency ", C_eff, " ", assume("collection efficiency"), "). Dashed: observed rain over the same years, for comparison. Demands needing more than ", max(area_grid), " acres are not shown."))}
+figs$need$p
+```
+
+# Water quality
+
+The system's water is tested as federal and state rules require; as of 2023 it was in full compliance with all drinking-water standards (Office of the Governor, 2023). Two recent detections show that what lands on the catchment reaches the tanks. In 2023, routine tests found the weed killer 2,4-D for the first time, at less than 0.6% of the legal limit (Office of the Governor, 2023). Samples taken from November 2023 to March 2026 at the system's rain-shed chlorinator found low levels of PFAS ("forever chemicals"), well below the state's screening level and not expected to pose a significant health risk (Maui Now, 2026). Neither detection is linked to climate, but a changing climate could make two kinds of contamination more likely:
+
+- **More dirt in the first flush.** Dust, bird and animal droppings, volcanic particles, mold and pollen build up on a catchment between rains, and the first rain after a dry spell washes most of them in (Macomber, 2020). Longer dry spells in both futures (`r tref("hrcm")`) mean more build-up before each storm.
+- **Smoke and ash.** Smoke and fumes from fires carry particles that settle on catchment surfaces and wash into the water (Macomber, 2020). The futures raise the risk of fire near the catchment (next section).
+
+# Wildfire
+
+Wildfires in Hawaiʻi are burning at ever-higher elevations, and the park's climate assessment expects both futures to continue that trend (NPS, 2024). It names the high shrublands on the park's northwest side, where the Summit District and its catchment sit, among the areas that could become more fire-prone, and notes that aging above-ground power lines add risk in the summit area (NPS, 2024).
+
+**Fires at the park's edge.** Wildfire has already come close to the Summit District twice in recent years:
+
+- **August 2023, Kula.** On August 8, 2023, the day of the Lahaina fire, a wildfire first reported near Olinda Road burned through Kula, below the park. It destroyed 25 homes and ʻohana units, according to the Federal Emergency Management Agency (KITV, 2024). The Summit District closed to visitors because of blocked road access, power outages, high winds and the fires outside the park (Maui Now, 2023).
+- **July 2024, Crater Road.** On July 10, 2024, a brush fire started along Crater Road, the road up to the Summit District, and burned 574 acres (Maui Now, 2024). The park closed, and the park's chief ranger reported the fire burning about a mile from the park entrance; 12 staff who live in the park were evacuated (The Maui News, 2024). No structural damage was reported (Maui Now, 2024).
+
+Maui County then closed Crater Road again for firefighting, cutting off the Summit District, and the park's closure alert stayed posted through at least August 4 (NPS, 2026).
+
+Both fires closed the Summit District, and the second came within about a mile of the park entrance. In September 2025, with fire danger severe, the park banned open fires and grills at Hosmer Grove Campground (NPS, 2026).
+
+How long it goes without rain is a strong predictor of fire: grasses can burn after about 14 days without rain and can carry large fires after about 30 (NPS, 2024). In the corrected model runs, the share of years with at least one dry spell of 30 days or more rises from `r int(FD("present", "p30"))`% in the present-day run to `r int(FD("cf1", "p30"))`% in <span class="cf1">Climate Future 1</span> and `r int(FD("cf2", "p30"))`% in <span class="cf2">Climate Future 2</span>. These counts use the report's 0.04-inch definition of a dry day and count spells within each Hawaiʻi water year.
+
+Fire would affect the water system in three ways:
+
+- **More water needed for firefighting** (NPS, 2024); the park's assessment recommends a separate non-potable supply for it (NPS, 2024). Putting out an average house fire takes about 2,570-3,430 gallons, depending on the size of the house (Macomber, 2020, citing the National Fire Protection Association).
+- **Damage to the system itself.** Hosmer Grove's historic redwood tanks are vulnerable to wildfire (NPS, 2024).
+- **Smoke and ash** washing into the tanks (previous section).
+
+# Severe storms
+
+**What happened in 2026.** Park staff report that one of the storms this year destroyed about 60% of the system's rain catchment, and that the park is rebuilding it to withstand storms, on or in the ground rather than as an above-ground structure (Haleakalā National Park staff, personal communication, 2026). 2026 was a stormy year on Maui:
+
+- **February 8-9:** a cold front brought strong north to northeast winds that brought down trees and power lines on Haleakalā's windward slope (NOAA NCEI, 2026b).
+- **March 12-14:** what NOAA describes as a "large and powerful" Kona storm (a type of winter low-pressure system; Longman et al., 2015b) caused flash flooding across Maui, with damage estimated at $`r int(dmg_usd(kona26$damage_property) / 1e6)` million in Maui County, including a washed-out section of Lower Kula Road (NOAA NCEI, 2026b). The National Weather Service issued a high wind watch for Haleakalā's summit (IEM, 2026).
+- **March 21-22 and April 7:** more flash flooding in Maui County (NOAA NCEI, 2026b).
+- **August 14-17:** a tropical storm watch and a flood watch for the summit (IEM, 2026).
+
+The park's report does not say which storm damaged the catchment. The HCDP rain maps record the rain these storms brought: the five wettest days at the Summit District since 1990 all fell in 2025-2026, led by `r num(obs_top$pr_in[1], 1)` inches on `r fdate(obs_top$date[1])` and `r num(obs[date == as.Date("2026-03-13")]$pr / 25.4, 1)` inches on March 13, 2026, during the Kona storm.
+
+**Storms at the summit before 2026.** NOAA's Storm Events Database, the National Weather Service's record of significant weather, lists `r nrow(hw)` high-wind events in the Haleakalā summit forecast zone between `r format(min(hw$date), "%Y")` and `r format(max(hw$date), "%Y")`, with gusts up to `r int(mph(max(hw$kt, na.rm = TRUE)))` mph (`r format(hw[which.max(kt)]$date, "%B %Y")`), and `r nrow(summit_ev[grepl("Winter", event_type)])` snow and ice storms (NOAA NCEI, 2026b). Since `r format(min(alerts$issue, na.rm = TRUE), "%Y")`, the Weather Service has issued `r AN("High Wind Warning")` high wind warnings, `r AN("Tropical Storm Warning")` tropical storm warnings, `r AN("Hurricane Warning")` hurricane warnings and `r AN("Winter Storm Warning")` winter storm warnings for the summit zone (IEM, 2026; `r fref("storms")`a). These counts depend partly on how the Weather Service names and issues its products, so they are not a measure of how storms are changing.
+
+The park's own alerts show what these storms do to the Summit District (NPS, 2026):
+
+- **February 2019:** closed for snow and ice, fallen trees and rocks, and numerous power outages; the summit visitor center ran on generators.
+- **July 2020:** the whole park closed ahead of Hurricane Douglas.
+- **December 2022:** a storm damaged the park's communication infrastructure. Park staff measured a 61-knot (70-mph) gust that week (NOAA NCEI, 2026b).
+- **January 2024:** Hosmer Grove Campground closed for severe weather, then the Summit District closed for high winds.
+- **January 29 - February 1, 2025:** the whole park closed after a severe storm while staff managed the damage. The HCDP rain maps show `r num(obs[date == as.Date("2025-01-30")]$pr / 25.4, 1)` inches at the Summit District on January 30.
+
+Winter weather also closed the Summit District in February 2021.
+
+**What the climate futures show.** The regional climate model saves wind as well as rain. At the catchment, its hourly winds barely change in either future (`r fref("storms")`b). The strongest hourly wind each year averages `r int(WC("cf1", "max_mph", "present"))` mph in the present-day run and `r int(WC("cf1", "max_mph", "future"))` and `r int(WC("cf2", "max_mph", "future"))` mph in <span class="cf1">Climate Future 1</span> and <span class="cf2">Climate Future 2</span>. Hours with strong wind (at least `r int(wind_thr)` mph, the windiest 1% of present-day hours) change by `r pc(WC("cf1", "strong_h"), 0)` and `r pc(WC("cf2", "strong_h"), 0)`. None of these changes is significant. For rain, the wettest day of the year grows `r num(H("cf2", "rx1"), 0)`% in <span class="cf2">Climate Future 2</span>, also too variable to be significant (`r fref("hrcm")`). These results come with two limits. Because the futures replay the storms of 1990-2009, they show how the same storms change in a warmer climate, not whether Kona storms or hurricanes become more or less common (Zhang et al., 2016). And hourly winds are averages; they do not capture the gusts that damage structures.
+
+**What research and the park's assessment expect.** A high-resolution global model projects that tropical cyclones will come near Hawaiʻi more often by 2075-2099, mainly because their tracks shift northwest toward the islands (Murakami et al., 2013). The regional climate model projects the heaviest rain events to increase (Zhang et al., 2016). The park's climate assessment expects more powerful windstorms, more frequent Kona storms and "flashier", more intense rain in both futures (NPS, 2024).
+
+**What it means for the system.** The parts above ground are the most exposed: the catchment surface itself, and the non-potable water lines; the drinking-water pipes are almost all buried (NPS, 2024). A storm that damages the catchment cuts the system's inflow at the time of year, the wet season, when the tanks would normally refill, and the same storms bring the heavy rain that overflows the tanks (NPS, 2024).
+
+```{r fig-storms, fig.width = figs$storms$w, fig.height = figs$storms$h, fig.cap = fcap("storms", paste0("Severe storms at the Summit District: warnings issued by the National Weather Service for the Haleakalā summit zone each year (a; IEM, 2026), and hours each year with hourly wind of at least ", int(wind_thr), " mph at the catchment in the regional climate model's present-day run and two futures (b). Years in (b) numbered as in ", fref("hrcm_ts"), "."))}
+figs$storms$p
+```
+
+# Recommendations
+
+**Adapt the system.**
+
+1. **Plan for the late dry season.** In the futures, the tanks empty late in the dry season and stay low into the wet season. A drought plan with triggers on tank level (for example, conservation measures when storage falls below a set share in the dry season) would stretch storage when it matters.
+2. **Enlarge the catchment and storage, and size them for the futures.** Keep the catchment surface, gutters and pipes in good repair so that collection efficiency stays high. The futures need `r num(need_pct("cf1"), 0)`-`r num(need_pct("cf2"), 0)`% more catchment to keep today's reliability `r assume("demand and catchment")`, more than the 15% expansion now proposed (NPS, 2024). Capturing the water that overflows in heavy rain, as the park has considered, would also help (NPS, 2024).
+3. **Reduce demand.** Every gallon saved lowers the catchment needed (`r fref("need")`).
+4. **Keep a backup.** Identify an emergency source for drought years; the park has already had to truck water in (NPS, 2024).
+5. **Protect water quality.** Keep first-flush diverters and screens working, so the dirtiest water after a dry spell stays out of the tanks (Macomber, 2020). Have a plan to divert or test water from the first rains after a nearby fire.
+6. **Prepare for fire.** Develop a separate non-potable water supply for firefighting, for example by restoring the historic frontcountry catchment, so that firefighting does not drain the drinking-water tanks (NPS, 2024). Clear fuels around the catchment and the redwood tanks, which are vulnerable to fire, and keep up maintenance of the summit power lines (NPS, 2024).
+
+7. **Build for storms.** Continue rebuilding the catchment on or in the ground, as the park has begun, and anchor or protect what must stay above ground. Inspect the catchment, gutters and above-ground lines after high wind warnings and heavy rain, so damage is found and repaired before the dry season.
+
+**Monitor, so the next assessment can answer the question directly.**
+
+1. **Measure the catchment.** Document its surface and area, the single largest unknown in this analysis.
+2. **Meter the system.** Record water produced and used (and the visitor-center haul), monthly at least.
+3. **Log tank levels.** Weekly levels of the two raw-water tanks would let the tank model be checked and used to forecast shortfalls.
+4. **Keep the ranger-station rain gauge reporting.** Its record has gaps since 2011; a complete daily record at the catchment is the best evidence of how rain is changing there.
+5. **Track water quality around dry spells and fires.** Test the raw water after the first rains that follow long dry spells or nearby fires.
+6. **Record storm damage.** Log each storm's date, the damage to the catchment and tanks, and how long the system was out of service; a wind and rain gauge at the catchment would tie that damage to the weather that caused it.
+
+# References
+
+Cao, G., Giambelluca, T. W., Stevens, D. E., & Schroeder, T. A. (2007). Inversion variability in the Hawaiian trade wind regime. Journal of Climate, 20(7), 1145-1160.
+
+Chu, P.-S., & Chen, H. (2005). Interannual and interdecadal rainfall variations in the Hawaiian Islands. Journal of Climate, 18(22), 4796-4813.
+
+Donohue, M. J., Macomber, P. S. H., Okimoto, D., & Lerner, D. T. (2017). Survey of rainwater catchment use and practices on Hawaii Island. Journal of Contemporary Water Research & Education, 161(1), 33-47. <https://doi.org/10.1111/j.1936-704X.2017.3250.x>
+
+Fewkes, A., & Butler, D. (2000). Simulating the performance of rainwater collection and reuse systems using behavioural models. Building Services Engineering Research and Technology, 21(2), 99-106.
+
+Finnigan, R. (2023b). Finding aid: Haleakalā National Park maps, plans, and drawings, 1869-2021, undated (HALE 9097). Haleakalā National Park, National Park Service. <https://www.nps.gov/hale/learn/upload/RG-07-Haleakal%C4%81-National-Park-Maps-Plans-and-Drawings_508.pdf>
+
+Frazier, A. G., & Giambelluca, T. W. (2017). Spatial trend analysis of Hawaiian rainfall from 1920 to 2012. International Journal of Climatology, 37(5), 2522-2531.
+
+Frazier, A. G., Elison Timm, O., Giambelluca, T. W., & Diaz, H. F. (2018). The influence of ENSO, PDO and PNA on secular rainfall variations in Hawaiʻi. Climate Dynamics, 51, 2127-2140.
+
+Frazier, A. G., Johnson, M.-V. V., Berio Fortini, L., Giardina, C. P., Grecni, Z. N., Kane, H. H., Keener, V. W., et al. (2023). Hawaiʻi and US-Affiliated Pacific Islands. In A. R. Crimmins et al. (Eds.), Fifth National Climate Assessment (Ch. 30). U.S. Global Change Research Program. <https://doi.org/10.7930/NCA5.2023.CH30>
+
+Hawaiʻi Department of Health (DOH). (2014). Guidelines for regulated rain catchment systems in Hawaii (September 2014; effective January 1, 2015). Safe Drinking Water Branch. <https://health.hawaii.gov/sdwb/files/2019/07/GUIDELINES-FOR-REGULATED-RAIN-CATCHMENT-SYSTEMS-IN-HAWAII.pdf>
+
+Iowa Environmental Mesonet (IEM). (2026). National Weather Service watch, warning and advisory archive (VTEC events), zone HIZ022, Haleakala Summit. Iowa State University. <https://mesonet.agron.iastate.edu/vtec/> (accessed October 19, 2026).
+
+Kendall, M. G. (1970). Rank Correlation Methods (4th ed.). Charles Griffin, London.
+
+KITV. (2024, August 5). One year after the Kula wildfire: Stories of survival, rebuilding, and the Aloha Spirit. <https://www.kitv.com/news/maui-perseveres/one-year-after-the-kula-wildfire-stories-of-survival-rebuilding-and-the-aloha-spirit/article_f9d1d2be-4fda-11ef-86a5-cb6e2efbdd0e.html>
+
+Lawrence, D. J., Runyon, A. N., Gross, J. E., Schuurman, G. W., & Miller, B. W. (2021). Divergent, plausible, and relevant climate futures for near- and long-term resource planning. Climatic Change, 167(3), 38.
+
+Longman, R. J., Diaz, H. F., & Giambelluca, T. W. (2015a). Sustained increases in lower-tropospheric subsidence over the central tropical North Pacific drive a decline in high-elevation rainfall in Hawaii. Journal of Climate, 28(22), 8743-8759.
+
+Longman, R. J., Frazier, A. G., Newman, A. J., Giambelluca, T. W., et al. (2019). High-resolution gridded daily rainfall and temperature for the Hawaiian Islands (1990-2014). Journal of Hydrometeorology, 20(3), 489-508.
+
+Longman, R. J., Giambelluca, T. W., Nullet, M. A., & Loope, L. L. (2015b). Climatology of Haleakalā. Technical Report 193. Pacific Cooperative Studies Unit, University of Hawaiʻi at Mānoa.
+
+Macomber, P. S. H. (2020). Guidelines on Rainwater Catchment Systems for Hawaiʻi (revised ed.). CTAHR Resource Management Publication RM-12. College of Tropical Agriculture and Human Resources, University of Hawaiʻi at Mānoa.
+
+Mann, H. B. (1945). Nonparametric tests against trend. Econometrica, 13(3), 245-259.
+
+Maui Now. (2023, August 8). Maui wildfire updates (live updates on the Lahaina and Kula fires). <https://mauinow.com/2023/08/08/haleakala-highway-closure-due-to-brush-fire-evacuation-of-kula-200-off-auli%CA%BBi-dr/>
+
+Maui Now. (2024, July 14). Crater Road fire Sunday update: 70% contained, 574 acres burned. <https://mauinow.com/2024/07/14/crater-road-fire-sunday-update-70contained-574-acres-burned/>
+
+Maui Now. (2026, May 11). PFAS detected in Haleakalā National Park water system. <https://mauinow.com/2026/05/11/pfas-detected-in-haleakala-national-park-water-system/>
+
+Menne, M. J., Durre, I., Vose, R. S., Gleason, B. E., & Houston, T. G. (2012). An overview of the Global Historical Climatology Network-Daily database. Journal of Atmospheric and Oceanic Technology, 29(7), 897-910. <https://doi.org/10.1175/JTECH-D-11-00103.1>
+
+Mitchell, V. G. (2007). How important is the selection of computational analysis method to the accuracy of rainwater tank behaviour modelling? Hydrological Processes, 21(21), 2850-2861.
+
+Murakami, H., Wang, B., Li, T., & Kitoh, A. (2013). Projected increase in tropical cyclones near Hawaii. Nature Climate Change, 3, 749-754. <https://doi.org/10.1038/nclimate1890>
+
+NOAA Climate Prediction Center (CPC). (2026). Oceanic Niño Index (ONI), ERSST.v5. <https://www.cpc.ncep.noaa.gov/data/indices/oni.ascii.txt> (accessed October 19, 2026).
+
+NOAA National Centers for Environmental Information (NCEI). (2026a). Pacific Decadal Oscillation (PDO) index, ERSST.v5. <https://www.ncei.noaa.gov/pub/data/cmb/ersst/v5/index/ersst.v5.pdo.dat> (accessed October 19, 2026).
+
+NOAA National Centers for Environmental Information (NCEI). (2026b). Storm Events Database, Hawaiʻi, 1996-2026. <https://www.ncei.noaa.gov/pub/data/swdi/stormevents/csvfiles/> (accessed October 19, 2026).
+
+NPS (2023). Climate futures for Haleakalā National Park (April 13, 2023). National Park Service Climate Change Response Program.
+
+NPS (2024). Climate change vulnerability assessment of Haleakalā National Park natural and cultural resources and built assets (draft, version April 26, 2024; in response to NPS Technical Assistance Request #19956). National Park Service.
+
+NPS (2025). National Park Service visitor use statistics. <https://irma.nps.gov/Stats/>
+
+NPS (2026). Haleakalā National Park alerts, January 2019 - February 2026: daily snapshots of the alerts posted for the park (project archive, data/all/nps_alerts). National Park Service.
+
+Office of the Governor, State of Hawaiʻi. (2023, June 29). DOH news release: Trace levels of contaminant detected in Haleakala National Park water system. <https://governor.hawaii.gov/newsroom/doh-news-release-trace-levels-of-contaminant-detected-in-haleakala-national-park-water-system/>
+
+OpenStreetMap contributors. (2026). OpenStreetMap. <https://www.openstreetmap.org> (accessed October 2026).
+
+Runyon, A. N., Gross, J. E., Schuurman, G. W., Lawrence, D. J., & Reynolds, J. H. (2024). Methods for assessing climate change exposure for national park planning. Park Resource Report NPS/PRR—2024/02. National Park Service, Fort Collins, Colorado. <https://doi.org/10.36967/2302720>
+
+Recreation Information Database (RIDB). (2026). RIDB/Recreation.gov historical reservation data, fiscal years 2017-2025. <https://ridb.recreation.gov/download> (accessed October 9, 2026).
+
+The Maui News. (2024, July). County warns residents in Upcountry area of 410-acre fire to be prepared to evacuate. <https://www.mauinews.com/news/local-news/2024/07/county-warns-residents-in-upcountry-area-of-410-acre-fire-to-be-prepared-to-evacuate/>
+
+Sen, P. K. (1968). Estimates of the regression coefficient based on Kendall's tau. Journal of the American Statistical Association, 63(324), 1379-1389.
+
+Thrasher, B., Brosnan, I., Frazier, A. G., Sanfilippo, K., & Lucas, M. P. (2026). NASA Earth eXchange Hawaiʻi downscaled climate projections CMIP6 (NEX-HIDCP-CMIP6) dataset. Data in Brief, 68, 113204. <https://doi.org/10.1016/j.dib.2026.113204>
+
+U.S. Environmental Protection Agency (EPA). (2026a). Safe Drinking Water Information System (SDWIS): water systems HI0000144, HI0000146, HI0000153, HI0000222 and HI0000260. Envirofacts. <https://data.epa.gov/efservice/> (accessed October 2, 2026).
+
+Wang, Y. (2017). Final report: Cloud water interception in Hawaiʻi: Building spatial pattern maps for the present-day climate and projected changes by the later 21st century using the Hawaiʻi Regional Climate Model (USGS agreement G15AP00166). International Pacific Research Center, University of Hawaiʻi. <https://www.sciencebase.gov/catalog/item/5a623f5de4b06e28e9c3d8b9>
+
+Zhang, C. (2017). Very fine resolution dynamically downscaled climate data for Hawaii. U.S. Geological Survey ScienceBase. <https://doi.org/10.21429/1vke-9325>
+
+Zhang, C., Wang, Y., Hamilton, K., & Lauer, A. (2016). Dynamical downscaling of the climate for the Hawaiian Islands. Part II: Projection for the late twenty-first century. Journal of Climate, 29(23), 8333-8354.
+
+
+```{r print-appendix, results = "asis"}
+cat(processing_md, sep = "\n")
+```
