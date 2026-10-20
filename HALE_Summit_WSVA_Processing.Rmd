@@ -122,6 +122,11 @@ pts_all$label <- sys_lab[pts_all$wsd_system_id]
 summit_pt <- pts_all %>% dplyr::filter(wsd_system_id == "HALE_WS_001") %>% dplyr::mutate(system = "Summit District")
 wv <- function(id, col) unique(sf::st_drop_geometry(wsd)[wsd$wsd_system_id == id, col])   # one WSD field for one system
 summit_storage <- as.numeric(wv("HALE_WS_001", "storage_capacity_gallons"))
+# Treatment step for the tank model: the storage is two 250,000-gal raw-water tanks and one 50,000-gal
+# treated-water tank (WSD description), joined by slow sand filters that treat about 8,000-9,000 gal
+# a day (NPS Office of Public Health inspections, 2013-2022); the lower figure is used
+treated_gal <- 50000
+filter_gpd <- 8000
 # Each system's physical setting (geology, soil, aquifer, watershed, moisture zone, land cover,
 # elevation), looked up from statewide GIS layers by hi_site_setting() in proc-download
 setting <- as.data.frame(readr::read_csv(f_setting, show_col_types = FALSE))
@@ -424,25 +429,28 @@ res_mon <- res[res_fy[, .(fac, fy)], on = .(fac, fy), nomatch = 0][, .(n = .N), 
 gpd_grid <- c(1000, 2000, 3000, 4000, 5000, 6000, 7500, 10000)
 area_grid <- c(seq(0.1, 20, by = 0.1), seq(20.25, 80, by = 0.25))   # acres
 # hi_catchment_needed(): runs the daily tank model (hi_tank_yas(): each day supply the smaller of
-# demand and what the tanks hold, then add the day's catch, spilling anything over capacity) for
+# demand and what the treated tank holds, add the day's catch to the raw-water tanks, spilling
+# anything over their capacity, then filter up to filter_gpd from the raw into the treated tank) for
 # every rain series x demand x catchment area, and returns the smallest area with no shortfall
 # on any day. Catch (gallons) = rain (mm) x area (m²) x collection efficiency x 0.264 gal/L.
-need <- hi_catchment_needed(cbind(P, P_chk), summit_storage, gpd_grid, area_grid, eff = C_eff)
+need <- hi_catchment_needed(cbind(P, P_chk), summit_storage, gpd_grid, area_grid, eff = C_eff,
+                            treated_gal = treated_gal, filter_gpd = filter_gpd)
 # Check (appendix): the same with the partly missing model days counted as dry instead of filled
 P_dry <- P
 for (i in seq_len(nrow(hr_miss))) P_dry[match(hr_miss$date[i], hr_days), hr_miss$run[i]] <- 0
-need_dry <- hi_catchment_needed(P_dry, summit_storage, dem_gpd, area_grid, eff = C_eff)
+need_dry <- hi_catchment_needed(P_dry, summit_storage, dem_gpd, area_grid, eff = C_eff,
+                                treated_gal = treated_gal, filter_gpd = filter_gpd)
 # The placeholder catchment: just large enough to meet the assumed demand in the present-day
 # run, unless set explicitly
 acres <- if (is.na(catchment_acres)) need[CF == "present" & gpd == dem_gpd]$acres_100 else catchment_acres
-short_dry <- sapply(colnames(P_dry), function(x) sum(hi_shortfall_days(P_dry[, x], acres * m2_per_acre, summit_storage, dem_gpd, eff = C_eff)))
-# Daily storage trace for the figure, and shortfall days: the same tank model written out, run
-# once per series at the placeholder catchment and assumed demand
+short_dry <- sapply(colnames(P_dry), function(x) sum(hi_shortfall_days(P_dry[, x], acres * m2_per_acre, summit_storage, dem_gpd, eff = C_eff,
+                                                                    treated_gal = treated_gal, filter_gpd = filter_gpd)))
+# Daily storage trace for the figure, and shortfall days: the same tank model (hi_tank_trace()),
+# run once per series at the placeholder catchment and assumed demand; storage is all tanks
 trace <- data.table::rbindlist(lapply(colnames(P), function(s) {
-  V <- summit_storage; v <- numeric(nrow(P)); short <- logical(nrow(P))
-  q <- acres * m2_per_acre * C_eff * gal_per_liter
-  for (t in seq_len(nrow(P))) { Y <- min(dem_gpd, V); short[t] <- Y < dem_gpd - 1e-9; V <- min(V + P[t, s] * q, summit_storage) - Y; v[t] <- V }
-  data.table::data.table(CF = s, date = hr_days, storage = v, short = short)
+  data.table::data.table(CF = s, date = hr_days,
+                         hi_tank_trace(P[, s], acres * m2_per_acre, summit_storage, dem_gpd, eff = C_eff,
+                                       treated_gal = treated_gal, filter_gpd = filter_gpd))
 }))
 trace[, `:=`(month = as.integer(format(date, "%m")), wy = hi_water_year(as.integer(format(date, "%Y")), as.integer(format(date, "%m"))))]
 short_sum <- trace[, .(short_days = sum(short), short_yr = 365.25 * mean(short), min_pct = 100 * min(storage) / summit_storage,
@@ -804,7 +812,7 @@ tabs$hrcm[, `:=`(`Present-day run ÷ observed, before correction` = ifelse(is.na
 
 **Future rain.** The Hawaiʻi Regional Climate Model (HRCM; Zhang, 2017) is the WRF weather model run on a 0.8-km grid. Its present-day run is driven by observed 1990-2009 weather; each late-century run adds the average change projected by 12 CMIP5 global models under RCP 4.5 or RCP 8.5 to that same weather (pseudo-global warming; Wang, 2017; Zhang et al., 2016). The runs were downloaded hourly for the nine 0.8-km cells around the system (`hi_hrcm_download()`), summed to Hawaiʻi Standard Time days, and compared run against run for Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)`. Model rain is incomplete on `r nrow(hr_miss)` days, because of a gap in the source data or the hour at which a run's running total restarts (`hi_hrcm_cell_rain()`): `r hr_miss_txt`. Each is filled from its valid hours, scaled up to a full day. `r d_acres <- max(abs(merge(need_dry, need[CF %in% names(cf_lab) & gpd == dem_gpd], by = c("CF", "gpd"))[, acres_100.x - acres_100.y])); d_days <- max(abs(short_dry[names(cf_lab)] - short_sum[match(names(cf_lab), CF)]$short_days)); if (d_acres == 0 && d_days == 0) "Counting them as dry instead changes neither the catchment needed nor the days demand is not met." else paste0("Counting them as dry instead changes the catchment needed by at most ", num(d_acres, 1), " acres and the days demand is not met by at most ", int(d_days), ".")` Differences were tested with a paired t-test on the `r length(hr_wys)` Hawaiʻi water years, because the runs share the same weather years (as in Zhang et al., 2016).
 
-**Correcting the model's rain.** The present-day run's rain is too heavy at the Summit (`r tref("hrcm")`). Every run's daily rain is multiplied by one factor for the wet season (November-April, `r num(hr_k[wet == TRUE]$k, 2)`) and one for the dry season (May-October, `r num(hr_k[wet == FALSE]$k, 2)`). Each factor is observed mean rain at the Summit (HCDP, Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)`) divided by the present-day run's, and the same factors apply to both futures. Each future's change in seasonal totals is therefore unchanged, and the model's day-to-day sequence of rain is kept. Rain days, dry spells and heavy days are counted on the corrected rain, so thresholds such as 1 inch apply to rain at the observed scale. One factor per season corrects amounts, not the model's timing within a season: the corrected present-day run has too little rain in November and too much in April and May (`r fref("monthly")`a). Correcting month by month instead gives about the same catchment needs for the present-day run and Climate Future 1 but a larger need for Climate Future 2 at `r int(dem_gpd)` gallons a day (`r num(need[CF == "present_monthly" & gpd == dem_gpd]$acres_100, 1)`, `r num(need[CF == "cf1_monthly" & gpd == dem_gpd]$acres_100, 1)` and `r num(need[CF == "cf2_monthly" & gpd == dem_gpd]$acres_100, 1)` acres for the present-day run and the two futures, vs. `r num(need[CF == "present" & gpd == dem_gpd]$acres_100, 1)`, `r num(need[CF == "cf1" & gpd == dem_gpd]$acres_100, 1)` and `r num(need[CF == "cf2" & gpd == dem_gpd]$acres_100, 1)`).
+**Correcting the model's rain.** The present-day run's rain is too heavy at the Summit (`r tref("hrcm")`). Every run's daily rain is multiplied by one factor for the wet season (November-April, `r num(hr_k[wet == TRUE]$k, 2)`) and one for the dry season (May-October, `r num(hr_k[wet == FALSE]$k, 2)`). Each factor is observed mean rain at the Summit (HCDP, Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)`) divided by the present-day run's, and the same factors apply to both futures. This is linear scaling (Lenderink et al., 2007; Teutschbein and Seibert, 2012), with seasonal instead of the usual monthly factors. Like any bias correction, it assumes the model's error stays the same in the future climate (Teutschbein and Seibert, 2012). Each future's change in seasonal totals is therefore unchanged, and the model's day-to-day sequence of rain is kept. Rain days, dry spells and heavy days are counted on the corrected rain, so thresholds such as 1 inch apply to rain at the observed scale. One factor per season corrects amounts, not the model's timing within a season: the corrected present-day run has too little rain in November and too much in April and May (`r fref("monthly")`a). Correcting month by month instead gives about the same catchment needs for the present-day run and Climate Future 1 but a larger need for Climate Future 2 at `r int(dem_gpd)` gallons a day (`r num(need[CF == "present_monthly" & gpd == dem_gpd]$acres_100, 1)`, `r num(need[CF == "cf1_monthly" & gpd == dem_gpd]$acres_100, 1)` and `r num(need[CF == "cf2_monthly" & gpd == dem_gpd]$acres_100, 1)` acres for the present-day run and the two futures, vs. `r num(need[CF == "present" & gpd == dem_gpd]$acres_100, 1)`, `r num(need[CF == "cf1" & gpd == dem_gpd]$acres_100, 1)` and `r num(need[CF == "cf2" & gpd == dem_gpd]$acres_100, 1)`).
 
 **Tank model.** A daily yield-after-spillage model (Fewkes and Butler, 2000; Mitchell, 2007) starts with full storage; each day the tanks supply the smaller of demand and what they hold, then take in the day's catch up to capacity. Rain on the catchment is converted to gallons with a collection efficiency of `r C_eff` {{ASSUMPTION}}. Each corrected run's daily rain for Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)` goes through the model as it is, so each future carries the model's own changes in rain days, dry spells and timing. As a check, observed rain on the same days goes through the same model (`r fref("need")`, dashed line).
 
