@@ -180,7 +180,7 @@ The park has three parts:
 
 **A rare and historic system.** Only four public water systems in Hawaiʻi regulated by the Department of Health draw their water from rain catchment. This is one of them; the others are at Hawaiʻi Volcanoes National Park, Kīlauea Military Camp and Kūlani Correctional Facility (Hawaiʻi DOH, 2014). The WSD names it the park's "Historic Water System", and the park archives hold its 1939 blueprints (Finnigan, 2023b). Beyond the park, rain catchment is part of everyday life in rural Hawaiʻi. An estimated 30,000 to 60,000 people in the state depend on it, mostly in the Puna, Kaʻū and Hāmākua districts of Hawaiʻi Island (Macomber, 2020), where most surveyed rural residents use catchment water for drinking or bathing (Donohue et al., 2017).
 
-```{r fig-map, fig.width = figs$map$w, fig.height = figs$map$h, fig.cap = fcap("map", "The Summit District water system, two of the places that use its water (arrows; water reaches the Haleakalā Visitor Center by a weekly truck haul), and the two rain gauges used in this report, over mean annual rain from the HCDP rain maps and the park boundary. Inset: Haleakalā National Park on Maui.")}
+```{r fig-map, fig.width = figs$map$w, fig.height = figs$map$h, fig.cap = fcap("map", "The Summit District water system, places that use its water (squares; water reaches the Haleakalā Visitor Center by a weekly truck haul), and the two rain gauges used in this report, over mean annual rain from the HCDP rain maps and the park boundary. Inset: Haleakalā National Park on Maui.")}
 figs$map$p
 ```
 

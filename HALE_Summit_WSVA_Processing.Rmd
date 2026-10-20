@@ -532,9 +532,6 @@ use_m <- to_m(c(hq_vc$FacilityLongitude, hosmer_ll[["lon"]], vc$FacilityLongitud
 vc_m <- use_m[3, ]
 gauge_m <- to_m(gauge_meta$longitude, gauge_meta$latitude, gauge_use[gauge_meta$id])
 xy <- function(g) sf::st_coordinates(g)[1, ]                           # x, y of a point
-# Arrows from the catchment to the places its water goes (the visitor center by weekly haul)
-flow <- data.table::rbindlist(lapply(list(vc_m, use_m[2, ]), function(g)
-  data.table::data.table(x = xy(cat_m)[1], y = xy(cat_m)[2], xend = xy(g)[1], yend = xy(g)[2])))
 park_m <- sf::st_transform(park_boundary, 3857)
 rain_fill <- scale_fill_gradientn("Mean annual rain,\n1991-2025 (in)", colours = c("#F3E3C3", "#C9D8A8", "#7DB8A6", "#3C8DA3", "#23557E", "#1B2F59"),
                                   trans = "log10", limits = c(30, 240), breaks = c(30, 60, 120, 240),
@@ -556,14 +553,12 @@ p_map_a <- ggplot() + geom_nps_basemap(tiles_a) +
   geom_sf(data = iso_all, color = "grey20", linewidth = 0.25, alpha = 0.8) +
   geom_sf_text(data = sf::st_point_on_surface(iso_all), aes(label = paste0(inch, " in")), size = 2.2, color = "grey10") +
   geom_sf(data = park_m, fill = NA, color = "#3b2a1a", linewidth = 0.7) +
-  geom_curve(data = flow, aes(x = x, y = y, xend = xend, yend = yend), curvature = -0.3, linewidth = 0.45, color = "#B03A2E",
-             arrow = grid::arrow(length = grid::unit(0.16, "cm"), type = "closed")) +
   geom_segment(data = lab_pts, aes(x = x, y = y, xend = lx, yend = ly), linewidth = 0.25, color = "grey25") +
   geom_sf(data = gauge_m, aes(shape = "Rain gauge"), size = 4, fill = "#1FB5C2", stroke = 0.8) +
   geom_sf(data = cat_m, aes(shape = "Rain catchment and tanks"), size = 5.5, fill = "#B03A2E", stroke = 1) +
-  geom_sf(data = use_m, aes(shape = "Uses the system's water"), size = 2.4, fill = "white", stroke = 0.8) +
+  geom_sf(data = use_m, aes(shape = "Uses the system's water"), size = 3.2, fill = "#F2A900", stroke = 0.8) +
   scale_shape_manual(NULL, values = c("Rain catchment and tanks" = 21, "Uses the system's water" = 22, "Rain gauge" = 24),
-                     guide = guide_legend(override.aes = list(fill = c("#B03A2E", "#1FB5C2", "white"), size = c(4, 3.4, 2.4)))) +
+                     guide = guide_legend(override.aes = list(fill = c("#B03A2E", "#1FB5C2", "#F2A900"), size = c(4, 3.4, 3.2)))) +
   geom_label(data = lab_pts, aes(lx, ly, label = lab), size = 2.3, lineheight = 0.95, label.size = 0.15,
              label.padding = grid::unit(0.15, "lines"), fill = scales::alpha("white", 0.92)) +
   coord_sf(crs = 3857, expand = FALSE, xlim = xl_a, ylim = yl_a) +
@@ -620,15 +615,16 @@ figs$trend <- list(p = patchwork::wrap_plots(p_t_a + theme(legend.position = "bo
 save_fig(figs$trend$p, "Summit_rain_trends", 8.5, 6.2)
 
 # ---- Figure: the rain shadow is widening (2,000-mm line each water year; area each water year) ---
-iso_df <- terra::as.data.frame(mean_r, xy = TRUE)
 yr_col <- scale_color_gradientn("Hawaiʻi\nwater year", colours = grDevices::hcl.colors(9, "Spectral", rev = TRUE),
                                 limits = range(iso_wy), breaks = seq(1995, 2025, 10))
-p_iso_a <- ggplot() + geom_raster(data = iso_df, aes(x, y, fill = pr_mm / 25.4)) +
-  scale_fill_gradient("Mean annual\nrain (in),\n1991-2025", low = "grey96", high = "grey35", trans = "log10", breaks = c(30, 60, 120, 240)) +
-  geom_sf(data = park_poly, fill = NA, color = "grey15", linewidth = 0.3) +
+# Over the NPS basemap saved for the report map (it covers the whole park), cropped to the park
+pb <- sf::st_bbox(park_m)
+p_iso_a <- ggplot() + geom_nps_basemap(tiles_a) +
+  geom_sf(data = park_m, fill = NA, color = "#3b2a1a", linewidth = 0.5) +
   geom_sf(data = iso_lines_wy, aes(color = wy), linewidth = 0.45, alpha = 0.9) + yr_col +
   geom_sf(data = summit_pt, shape = 21, fill = "#B03A2E", size = 2.4) +
-  coord_sf(expand = FALSE) + labs(x = NULL, y = NULL, title = "(a) Where the 79-inch line sits, each year") +
+  coord_sf(crs = 3857, expand = FALSE, xlim = pb[c("xmin", "xmax")] + c(-800, 800), ylim = pb[c("ymin", "ymax")] + c(-800, 800)) +
+  labs(x = NULL, y = NULL, title = "(a) Where the 79-inch line sits, each year") +
   theme_bw(base_size = 8) + theme(legend.position = "none")
 # Sen's slope line through the median point, for panel (b)
 iso_fit <- data.table::data.table(wy = range(iso_area$wy))[, km2 := stats::median(iso_area$km2) + iso_trend$sen / 10 * (wy - stats::median(iso_area$wy))]
