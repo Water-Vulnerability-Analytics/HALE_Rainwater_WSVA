@@ -251,6 +251,13 @@ gi <- gauge_prcp[id %in% names(gauge_use), .(site = gauge_use[id], date, prcp_mm
 hcdp_i <- obs[, .(site = "HCDP map, Summit District", date, prcp_mm = pr)] %>%
   calc_precip_indices(wet_day_mm = 1, heavy_day_mm = 25.4, min_complete = 0.9, scale_missing = TRUE) %>% data.table::as.data.table()
 hcdp_i <- hcdp_i[water_year %in% base_wy]
+# Summit rain (HCDP map) by El Niño / La Niña phase and by the PDO index
+summit_cl <- merge(hcdp_i[, .(wy = water_year, inch = annual_mm / 25.4)], climate_wy, by = "wy")
+summit_enso <- summit_cl[, .(inch = mean(inch), n = .N), by = enso]
+summit_enso_p <- c(en_ln = stats::wilcox.test(summit_cl[enso == "El Niño"]$inch, summit_cl[enso == "La Niña"]$inch)$p.value,
+                   neutral = stats::wilcox.test(summit_cl[enso == "Neutral"]$inch, summit_cl[enso != "Neutral"]$inch)$p.value)
+summit_pdo <- summit_cl[, .(inch = mean(inch), neutral = mean(enso == "Neutral"), n = .N), by = phase]
+summit_pdo_cor <- stats::cor.test(summit_cl$inch, summit_cl$pdo, method = "spearman", exact = FALSE)
 rs_lab <- gauge_use[["USC00511004"]]
 rs <- gi[site == rs_lab]
 idx <- c(annual_mm = "Annual rain", wet_season_mm = "Wet-season rain (Nov-Apr)", dry_season_mm = "Dry-season rain (May-Oct)",
