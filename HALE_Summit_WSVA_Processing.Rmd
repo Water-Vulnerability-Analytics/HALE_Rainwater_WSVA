@@ -23,7 +23,7 @@ options(hi.fig_dir = file.path("data", "park", park, "Figs"))
 theme_cf <- theme_bw(base_size = 9) +
   theme(strip.background = element_rect(fill = "gray95"), strip.text = element_text(colour = "black", face = "bold"),
         legend.position = "bottom")
-fig_ids <- c("map", "trend", "shadow", "hrcm", "hrcm_ts", "monthly", "visits", "storage", "need", "storms")
+fig_ids <- c("map", "trend", "shadow", "hrcm", "hrcm_ts", "monthly", "visits", "storage", "need", "storms", "cells")
 tab_ids <- c("bluf", "trend", "hrcm")
 fref <- function(id) paste("Figure", match(id, fig_ids))
 tref <- function(id) paste("Table", match(id, tab_ids))
@@ -276,7 +276,7 @@ rs_strict <- trend_of(rs[n_missing <= 3], rs_lab)[index == "wet_days"][, pct_dec
 # ... and with missing days counted as dry (no scaling), for comparison
 rs_noscale <- trend_of(data.table::as.data.table(calc_precip_indices(gauge_prcp[id == "USC00511004", .(site = rs_lab, date, prcp_mm)],
                          wet_day_mm = 1, heavy_day_mm = 25.4, min_complete = 0.9)), rs_lab)[index == "wet_days"][, pct_dec := 100 * sen / mean]
-# Gauge vs. HCDP map at the Summit, overlapping complete water years
+# Gauge vs. HCDP map at the Summit District, overlapping complete water years
 ov <- merge(rs[, .(water_year, g = annual_mm)], hcdp_i[, .(water_year, h = annual_mm)], by = "water_year")
 ov_r <- stats::cor(ov$g, ov$h)
 # Timing: mean monthly rain at the gauge, first vs. second 30 years of its complete record
@@ -464,6 +464,40 @@ short_sum <- trace[, .(short_days = sum(short), short_yr = 365.25 * mean(short),
                        years_short = data.table::uniqueN(wy[short]),
                        longest = { r <- rle(short); if (any(r$values)) max(r$lengths[r$values]) else 0L }), by = CF]
 short_mon <- trace[short == TRUE, .N, by = .(CF, month)]                # when in the year shortfalls fall
+# Check (appendix): the same steps with other model cells around the system: the nearest cell
+# alone, it and its nearer east-west neighbour, and the 2 x 2 blocks just north and south of those
+# two. The system's point sits near the edge between two columns, so no 2 x 2 block is centred on it.
+# Each set gets its own seasonal correction and its own present-day catchment.
+hr_cell_rain <- data.table::rbindlist(lapply(names(hr_runs), function(r) {
+  x <- data.table::as.data.table(arrow::read_parquet(file.path(hrcm_dir, paste0(hr_runs[[r]], ".parquet"))))
+  merge(hr_cells[, .(we, sn)], x, by = c("we", "sn"))[, run := r]
+}))
+c0 <- hr_cells[which.min(dist_km)]
+we2 <- hr_cells[sn == c0$sn & we != c0$we][which.min(dist_km)]$we
+hr_cell_sets <- list(nearest = data.table::data.table(we = c0$we, sn = c0$sn),
+                     pair = data.table::data.table(we = c(c0$we, we2), sn = c0$sn),
+                     north = data.table::CJ(we = c(c0$we, we2), sn = c0$sn + 0:1),
+                     south = data.table::CJ(we = c(c0$we, we2), sn = c0$sn - 1:0))
+hr_cell_sens <- data.table::rbindlist(lapply(names(hr_cell_sets), function(s) {
+  hh <- merge(hr_cell_sets[[s]], hr_cell_rain, by = c("we", "sn"))[, .(rain_mm = mean(rain_mm)), by = .(run, time_utc)]
+  d <- hh[, hi_hrcm_daily(.SD[, .(system = "Summit District", time_utc, rain_mm)], "system"), by = run]
+  d <- merge(data.table::CJ(run = names(hr_runs), date = hr_days), d[, .(run, date, pr)], by = c("run", "date"), all.x = TRUE)
+  part <- hh[, .(run, date = as.Date(time_utc - 3600 - 10 * 3600, tz = "UTC"), rain_mm)][
+    , .(pr_fill = sum(rain_mm, na.rm = TRUE) * 24 / sum(!is.na(rain_mm))), by = .(run, date)]
+  d[part, on = .(run, date), pr := data.table::fifelse(is.na(pr), i.pr_fill, pr)]
+  stopifnot(all(is.finite(d$pr)))
+  d[, wet := as.integer(format(date, "%m")) %in% wet_months]
+  k <- merge(obs_hr[, .(obs = mean(pr)), by = wet], d[run == "present", .(model = mean(pr)), by = wet], by = "wet")[, k := obs / model]
+  d[, pr := pr * k$k[match(wet, k$wet)]]
+  Ps <- sapply(names(cf_lab), function(r) d[run == r][order(date)]$pr)
+  a <- hi_catchment_needed(Ps, summit_storage, dem_gpd, area_grid, eff = C_eff, treated_gal = treated_gal, filter_gpd = filter_gpd)
+  a <- stats::setNames(a$acres_100, a$CF)
+  data.table::data.table(set = s, cf = c("cf1", "cf2"), more = 100 * (a[c("cf1", "cf2")] / a[["present"]] - 1),
+    short = sapply(c("cf1", "cf2"), function(f) sum(hi_shortfall_days(Ps[, f], a[["present"]] * m2_per_acre, summit_storage, dem_gpd,
+                                                                      eff = C_eff, treated_gal = treated_gal, filter_gpd = filter_gpd))),
+    ann = sapply(c("cf1", "cf2"), function(f) 100 * (sum(Ps[, f]) / sum(Ps[, "present"]) - 1)))
+}))
+stopifnot(nrow(hr_cell_sens) == 8, all(hr_cell_sens$more > 0), all(hr_cell_sens$ann < 0))
 ```
 
 ```{r proc-storms, include = FALSE}
@@ -652,7 +686,7 @@ p_iso_b <- ggplot(iso_area, aes(wy, km2)) +
 figs$shadow <- list(p = patchwork::wrap_plots(p_iso_a, p_iso_b, nrow = 1, widths = c(1.45, 1)), w = 9, h = 5)
 save_fig(figs$shadow$p, "Summit_rain_shadow", 9, 5)
 
-# ---- Figure: rain at the Summit in the two futures (HRCM) ---------------------------------
+# ---- Figure: rain at the catchment in the two futures (HRCM) ---------------------------------
 show_m <- c("ann", "dry_mm", "wet_mm", "rain_days", "cdd_dry", "wet_spell", "heavy", "rx1", "hmax")
 hc <- hr_chg[m %in% show_m][, `:=`(meas = factor(hr_meas[m], rev(hr_meas[show_m])), cf = factor(cf_lab[cf], cf_lab[c("cf2", "cf1")]),
                                   sig = p < 0.05)]
@@ -761,6 +795,43 @@ p_st_b <- ggplot(wind_wy[, .(cfl = factor(cf_lab[run], cf_lab), year = wy - min(
   theme_cf + guides(color = guide_legend(nrow = 3))
 figs$storms <- list(p = patchwork::wrap_plots(p_st_a, p_st_b, nrow = 1), w = 9, h = 3.8)
 save_fig(figs$storms$p, "Summit_storms", 9, 3.8)
+
+# ---- Figure (appendix): the grid cells behind the catchment's rain ----------------------------
+# The 3 x 3 HCDP cells (observed rain) and 3 x 3 HRCM cells (model runs) averaged in this report.
+# Each cell is drawn as a rectangle half the centre spacing either side of its centre: exact for
+# the HCDP grid; the HRCM grid is in its own map projection, so its true edges differ slightly.
+cell_polys <- function(d) {
+  dlon <- diff(sort(unique(d$lon)))[1] / 2; dlat <- diff(sort(unique(d$lat)))[1] / 2
+  sf::st_sf(geometry = sf::st_sfc(lapply(seq_len(nrow(d)), function(i) {
+    x <- d$lon[i]; y <- d$lat[i]
+    sf::st_polygon(list(rbind(c(x - dlon, y - dlat), c(x + dlon, y - dlat), c(x + dlon, y + dlat), c(x - dlon, y + dlat), c(x - dlon, y - dlat))))
+  }), crs = 4326)) %>% sf::st_transform(3857)
+}
+hc_sf <- cell_polys(data.table::as.data.table(nex_cells)[cell_id %in% sc$cell_id])
+hr_sf <- cell_polys(hr_cells)
+blk_km <- function(g) sqrt(sum(as.numeric(sf::st_area(sf::st_transform(g, 4326))))) / 1000   # side of a square of the same area
+stopifnot(nrow(hc_sf) == 9, nrow(hr_sf) == 9, round(blk_km(hc_sf), 1) == 0.7, round(blk_km(hr_sf), 1) == 2.2)   # as stated in the text
+bb <- sf::st_bbox(hr_sf)
+xl_c <- c(bb[["xmin"]], bb[["xmax"]]) + c(-900, 900); yl_c <- c(bb[["ymin"]], bb[["ymax"]]) + c(-900, 900)
+tiles_c <- tiles_for(xl_c, yl_c, "standard", 15, "catchment_standard")
+k_m <- 1 / cos(sf::st_coordinates(summit_pt)[1, 2] * pi / 180)          # Web Mercator metres per ground metre
+lab_hc <- paste0("HCDP rain maps: 9 cells, block about ", num(blk_km(hc_sf), 1), " km across")
+lab_hr <- paste0("HRCM climate model: 9 cells, block about ", num(blk_km(hr_sf), 1), " km across")
+p_cells <- ggplot() + geom_nps_basemap(tiles_c) +
+  geom_sf(data = park_m, fill = NA, color = "#3b2a1a", linewidth = 0.6, linetype = "22") +
+  geom_sf(data = hr_sf, aes(color = lab_hr), fill = "#C2410C", alpha = 0.10, linewidth = 0.7) +
+  geom_sf(data = hc_sf, aes(color = lab_hc), fill = "#1F6FB2", alpha = 0.35, linewidth = 0.5) +
+  geom_sf(data = cat_m, aes(shape = "Catchment location in the WSD (low confidence)"), fill = "#F2A900", color = "black", size = 3.6, stroke = 0.9) +
+  annotate("rect", xmin = xl_c[1] + 250, xmax = xl_c[1] + 250 + 1000 * k_m, ymin = yl_c[1] + 250, ymax = yl_c[1] + 295, fill = "black") +
+  annotate("text", x = xl_c[1] + 250 + 500 * k_m, y = yl_c[1] + 390, label = "1 km", size = 3.4) +
+  scale_color_manual(NULL, values = stats::setNames(c("#1F6FB2", "#C2410C"), c(lab_hc, lab_hr)), breaks = c(lab_hc, lab_hr)) +
+  scale_shape_manual(NULL, values = 21) +
+  guides(color = guide_legend(order = 1, ncol = 1, override.aes = list(fill = c("#1F6FB2", "#C2410C"), alpha = c(0.35, 0.15))),
+         shape = guide_legend(order = 2)) +
+  coord_sf(crs = 3857, expand = FALSE, xlim = xl_c, ylim = yl_c) +
+  labs(x = NULL, y = NULL) + theme_void(base_size = 11) +
+  theme(legend.position = "bottom", legend.box = "vertical", legend.box.just = "left", legend.margin = margin(0, 0, 0, 0))
+figs$cells <- save_fig(p_cells, "Summit_rain_cells", 6.5, 7.2)
 ```
 
 ```{r proc-tables, include = FALSE}
@@ -805,7 +876,7 @@ tabs$hrcm[, `:=`(`Present-day run ÷ observed, before correction` = ifelse(is.na
 
 **Question.** Could the Summit District's rain catchment, with its 550,000 gallons of storage, meet the park's needs under the two climate futures? The analysis follows the NPS approach of bounding the future with two divergent climate futures (Lawrence et al., 2021; Runyon et al., 2024) and uses the two futures already defined for HALE (NPS, 2023).
 
-**Observed rain.** The HCDP rain maps: daily rain maps from the Hawaiʻi Climate Data Portal (Longman et al., 2019) on a 250-m grid, averaged over the nine cells around the system's location. The record runs from 1990 through `r format(obs_last, "%B %e, %Y")`; Hawaiʻi water years `r min(base_wy)`-`r max(base_wy)` are complete. `r length(obs_na_days)` day (`r paste(format(obs_na_days), collapse = ", ")`) is missing at the source; yearly totals that include it are scaled up by the share of days observed, as for the gauges. The maps describe current rain and the rain shadow, and Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)` set the correction of the climate model's rain (below). Long-term trends use the park's own rain gauge, the Summit District gauge (GHCN-Daily station `r names(gauge_use)[1]`, Haleakalā Ranger Station; Menne et al., 2012), Hawaiʻi water years `r min(rs$water_year)`-`r max(rs$water_year)`, and the Kula gauge (Kula Branch Station, `r min(gi[site == gauge_use[[2]]]$water_year)`-`r max(gi[site == gauge_use[[2]]]$water_year)`). A water year counts when at least 90% of its days were observed. Within those years, rain totals and counts of rain days and heavy days are scaled up by the share of days observed (`calc_precip_indices()`, `scale_missing = TRUE`), so a year with gaps does not look drier. This matters at the Summit District gauge, whose gaps are not spread evenly: `r int(sum(rs[water_year >= 2001]$n_missing))` of its `r int(sum(rs$n_missing))` missing days fall in Hawaiʻi water years 2001-`r max(rs$water_year)`. Counting missing days as dry instead would give a rain-day decline of `r num(abs(rs_noscale$pct_dec), 1)`% per decade (`r ifelse(rs_noscale$p < 0.01, "p < 0.01", paste("p =", num(rs_noscale$p, 2)))`), against `r num(abs(g_trend[site == rs_lab & index == "wet_days"]$pct_dec), 1)`% with scaling. Using only years with at most 3 missing days gives `r pc(rs_strict$pct_dec, 1)` per decade (p = `r num(rs_strict$p, 2)`), but that leaves out most of the 2000s, so it cannot tell a real decline from the gaps. Trends are Sen's slope with the Mann-Kendall test (Sen, 1968; Mann, 1945; Kendall, 1970). Over the Hawaiʻi water years both cover, the Summit District gauge and the HCDP rain maps agree on year-to-year totals (r = `r num(ov_r, 2)`).
+**Observed rain.** The HCDP rain maps: daily rain maps from the Hawaiʻi Climate Data Portal (Longman et al., 2019) on a 250-m grid, averaged over the nine cells around the system's location (a block about 0.7 km across). The record runs from 1990 through `r format(obs_last, "%B %e, %Y")`; Hawaiʻi water years `r min(base_wy)`-`r max(base_wy)` are complete. `r length(obs_na_days)` day (`r paste(format(obs_na_days), collapse = ", ")`) is missing at the source; yearly totals that include it are scaled up by the share of days observed, as for the gauges. The maps describe current rain and the rain shadow, and Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)` set the correction of the climate model's rain (below). Long-term trends use the park's own rain gauge, the Summit District gauge (GHCN-Daily station `r names(gauge_use)[1]`, Haleakalā Ranger Station; Menne et al., 2012), Hawaiʻi water years `r min(rs$water_year)`-`r max(rs$water_year)`, and the Kula gauge (Kula Branch Station, `r min(gi[site == gauge_use[[2]]]$water_year)`-`r max(gi[site == gauge_use[[2]]]$water_year)`). A water year counts when at least 90% of its days were observed. Within those years, rain totals and counts of rain days and heavy days are scaled up by the share of days observed (`calc_precip_indices()`, `scale_missing = TRUE`), so a year with gaps does not look drier. This matters at the Summit District gauge, whose gaps are not spread evenly: `r int(sum(rs[water_year >= 2001]$n_missing))` of its `r int(sum(rs$n_missing))` missing days fall in Hawaiʻi water years 2001-`r max(rs$water_year)`. Counting missing days as dry instead would give a rain-day decline of `r num(abs(rs_noscale$pct_dec), 1)`% per decade (`r ifelse(rs_noscale$p < 0.01, "p < 0.01", paste("p =", num(rs_noscale$p, 2)))`), against `r num(abs(g_trend[site == rs_lab & index == "wet_days"]$pct_dec), 1)`% with scaling. Using only years with at most 3 missing days gives `r pc(rs_strict$pct_dec, 1)` per decade (p = `r num(rs_strict$p, 2)`), but that leaves out most of the 2000s, so it cannot tell a real decline from the gaps. Trends are Sen's slope with the Mann-Kendall test (Sen, 1968; Mann, 1945; Kendall, 1970). Over the Hawaiʻi water years both cover, the Summit District gauge and the HCDP rain maps agree on year-to-year totals (r = `r num(ov_r, 2)`).
 
 **Reservations.** Hosmer Grove Campground (facility 10068557) and summit sunrise (facility 253731) bookings come from the RIDB/Recreation.gov historical reservation files for fiscal years 2017-2025 (RIDB, 2026), downloaded and filtered by `get_ridb_reservations()`. Reservations repeated in two yearly files are counted once, each is assigned to the fiscal year of its start date, and only complete fiscal years are shown. The files do not flag cancellations, so nights can show more bookings than sites.
 
@@ -813,15 +884,21 @@ tabs$hrcm[, `:=`(`Present-day run ÷ observed, before correction` = ifelse(is.na
 
 **Storms.** Past storms come from NOAA's Storm Events Database (NOAA NCEI, 2026b; Hawaiʻi records 1996 on, read by `get_storm_events()`; wind magnitudes are gusts in knots, converted to mph) and the Iowa Environmental Mesonet archive of National Weather Service alerts for the Haleakalā summit zone, HIZ022 (IEM, 2026; `get_nws_alerts()`). Storm Events for 2026 run through `r format(max(storm_ev$date, na.rm = TRUE), "%B %Y")` at the time of download. Future wind is the regional climate model's hourly 10-m wind (`U10`, `V10`), downloaded for the nine cells around the catchment (`hi_hrcm_download_wind()`) and averaged. *Strong wind* is an hour at or above the present-day run's 99th percentile, `r int(wind_thr)` mph. Changes are tested with the same paired t-test as rain. The model's wind is not corrected against observations, so only its changes are used.
 
-**Future rain.** The Hawaiʻi Regional Climate Model (HRCM; Zhang, 2017) is the WRF weather model run on a 0.8-km grid. Its present-day run is driven by observed 1990-2009 weather; each late-century run adds the average change projected by 12 CMIP5 global models under RCP 4.5 or RCP 8.5 to that same weather (pseudo-global warming; Wang, 2017; Zhang et al., 2016). The runs were downloaded hourly for the nine 0.8-km cells around the system (`hi_hrcm_download()`), summed to Hawaiʻi Standard Time days, and compared run against run for Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)`. Model rain is incomplete on `r nrow(hr_miss)` days, because of a gap in the source data or the hour at which a run's running total restarts (`hi_hrcm_cell_rain()`): `r hr_miss_txt`. Each is filled from its valid hours, scaled up to a full day. `r d_acres <- max(abs(merge(need_dry, need[CF %in% names(cf_lab) & gpd == dem_gpd], by = c("CF", "gpd"))[, acres_100.x - acres_100.y])); d_days <- max(abs(short_dry[names(cf_lab)] - short_sum[match(names(cf_lab), CF)]$short_days)); if (d_acres == 0 && d_days == 0) "Counting them as dry instead changes neither the catchment needed nor the days demand is not met." else paste0("Counting them as dry instead changes the catchment needed by at most ", num(d_acres, 1), " acres and the days demand is not met by at most ", int(d_days), ".")` Differences were tested with a paired t-test on the `r length(hr_wys)` Hawaiʻi water years, because the runs share the same weather years (as in Zhang et al., 2016).
+**Future rain.** The Hawaiʻi Regional Climate Model (HRCM; Zhang, 2017) is the WRF weather model run on a 0.8-km grid. Its present-day run is driven by observed 1990-2009 weather; each late-century run adds the average change projected by 12 CMIP5 global models under RCP 4.5 or RCP 8.5 to that same weather (pseudo-global warming; Wang, 2017; Zhang et al., 2016). The runs were downloaded hourly for the nine 0.8-km cells around the system (a block about 2.2 km across, mapped in `r fref("cells")`; `hi_hrcm_download()`), summed to Hawaiʻi Standard Time days, and compared run against run for Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)`. Model rain is incomplete on `r nrow(hr_miss)` days, because of a gap in the source data or the hour at which a run's running total restarts (`hi_hrcm_cell_rain()`): `r hr_miss_txt`. Each is filled from its valid hours, scaled up to a full day. `r d_acres <- max(abs(merge(need_dry, need[CF %in% names(cf_lab) & gpd == dem_gpd], by = c("CF", "gpd"))[, acres_100.x - acres_100.y])); d_days <- max(abs(short_dry[names(cf_lab)] - short_sum[match(names(cf_lab), CF)]$short_days)); if (d_acres == 0 && d_days == 0) "Counting them as dry instead changes neither the catchment needed nor the days demand is not met." else paste0("Counting them as dry instead changes the catchment needed by at most ", num(d_acres, 1), " acres and the days demand is not met by at most ", int(d_days), ".")` Differences were tested with a paired t-test on the `r length(hr_wys)` Hawaiʻi water years, because the runs share the same weather years (as in Zhang et al., 2016).
 
-**Correcting the model's rain.** The present-day run's rain is too heavy at the Summit (`r tref("hrcm")`). Every run's daily rain is multiplied by one factor for the wet season (November-April, `r num(hr_k[wet == TRUE]$k, 2)`) and one for the dry season (May-October, `r num(hr_k[wet == FALSE]$k, 2)`). Each factor is observed mean rain at the Summit (HCDP, Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)`) divided by the present-day run's, and the same factors apply to both futures. This is linear scaling (Lenderink et al., 2007; Teutschbein and Seibert, 2012), with seasonal instead of the usual monthly factors. Like any bias correction, it assumes the model's error stays the same in the future climate (Teutschbein and Seibert, 2012). Each future's change in seasonal totals is therefore unchanged, and the model's day-to-day sequence of rain is kept. Rain days, dry spells and heavy days are counted on the corrected rain, so thresholds such as 1 inch apply to rain at the observed scale. One factor per season corrects amounts, not the model's timing within a season: the corrected present-day run has too little rain in November and too much in April and May (`r fref("monthly")`a). Correcting month by month instead gives about the same catchment needs for the present-day run and Climate Future 1 but a larger need for Climate Future 2 at `r int(dem_gpd)` gallons a day (`r num(need[CF == "present_monthly" & gpd == dem_gpd]$acres_100, 1)`, `r num(need[CF == "cf1_monthly" & gpd == dem_gpd]$acres_100, 1)` and `r num(need[CF == "cf2_monthly" & gpd == dem_gpd]$acres_100, 1)` acres for the present-day run and the two futures, vs. `r num(need[CF == "present" & gpd == dem_gpd]$acres_100, 1)`, `r num(need[CF == "cf1" & gpd == dem_gpd]$acres_100, 1)` and `r num(need[CF == "cf2" & gpd == dem_gpd]$acres_100, 1)`).
+**Correcting the model's rain.** The present-day run's rain is too heavy at the catchment (`r tref("hrcm")`). Every run's daily rain is multiplied by one factor for the wet season (November-April, `r num(hr_k[wet == TRUE]$k, 2)`) and one for the dry season (May-October, `r num(hr_k[wet == FALSE]$k, 2)`). Each factor is observed mean rain at the catchment (HCDP, Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)`) divided by the present-day run's, and the same factors apply to both futures. The factors therefore also absorb the difference between the model's 2.2-km block and the HCDP's 0.7-km block. This is linear scaling (Lenderink et al., 2007; Teutschbein and Seibert, 2012), with seasonal instead of the usual monthly factors. Like any bias correction, it assumes the model's error stays the same in the future climate (Teutschbein and Seibert, 2012). Each future's change in seasonal totals is therefore unchanged, and the model's day-to-day sequence of rain is kept. Rain days, dry spells and heavy days are counted on the corrected rain, so thresholds such as 1 inch apply to rain at the observed scale. One factor per season corrects amounts, not the model's timing within a season: the corrected present-day run has too little rain in November and too much in April and May (`r fref("monthly")`a). Correcting month by month instead gives about the same catchment needs for the present-day run and Climate Future 1 but a larger need for Climate Future 2 at `r int(dem_gpd)` gallons a day (`r num(need[CF == "present_monthly" & gpd == dem_gpd]$acres_100, 1)`, `r num(need[CF == "cf1_monthly" & gpd == dem_gpd]$acres_100, 1)` and `r num(need[CF == "cf2_monthly" & gpd == dem_gpd]$acres_100, 1)` acres for the present-day run and the two futures, vs. `r num(need[CF == "present" & gpd == dem_gpd]$acres_100, 1)`, `r num(need[CF == "cf1" & gpd == dem_gpd]$acres_100, 1)` and `r num(need[CF == "cf2" & gpd == dem_gpd]$acres_100, 1)`).
+
+**Which model cells.** The results change somewhat with the model cells averaged (`r fref("cells")`). The system's mapped location sits near the edge between two model cells, so no 2 x 2 block is centred on it. Every step was therefore repeated with the nearest cell alone, with it and its nearer neighbour, and with the 2 x 2 blocks just north and south of those two. Across these, <span class="cf1">Climate Future 1</span> needs `r int(min(hr_cell_sens[cf == "cf1"]$more))`-`r int(max(hr_cell_sens[cf == "cf1"]$more))`% more catchment than the present-day run and <span class="cf2">Climate Future 2</span> `r int(min(hr_cell_sens[cf == "cf2"]$more))`-`r int(max(hr_cell_sens[cf == "cf2"]$more))`% more, against `r int(100 * (need[CF == "cf1" & gpd == dem_gpd]$acres_100 / acres - 1))`% and `r int(100 * (need[CF == "cf2" & gpd == dem_gpd]$acres_100 / acres - 1))`% with the nine cells. Demand goes unmet on `r int(min(hr_cell_sens[cf == "cf1"]$short))`-`r int(max(hr_cell_sens[cf == "cf1"]$short))` and `r int(min(hr_cell_sens[cf == "cf2"]$short))`-`r int(max(hr_cell_sens[cf == "cf2"]$short))` days, against `r short_sum[CF == "cf1"]$short_days` and `r short_sum[CF == "cf2"]$short_days`. Both futures are drier in every case, but the count of days demand goes unmet is the most sensitive result. The nine-cell block is kept for two reasons. It is centred on the system, so no side has to be chosen. And an average over nine cells shifts less than one over one, two or four cells if the mapped location, which the WSD rates as low confidence, is off by a few hundred metres.
+
+```{r fig-cells, fig.width = figs$cells$w, fig.height = figs$cells$h, fig.cap = fcap("cells", "The grid cells averaged for rain at the catchment: the nine HCDP rain-map cells (blue) and the nine HRCM climate-model cells (orange), centred on the catchment's location in the WSD, on NPS Park Tiles. Dashed line: park boundary.")}
+figs$cells$p
+```
 
 **Tank model.** A daily yield-after-spillage model (Fewkes and Butler, 2000; Mitchell, 2007) starts with full storage; each day the tanks supply the smaller of demand and what they hold, then take in the day's catch up to capacity. Rain on the catchment is converted to gallons with a collection efficiency of `r C_eff` {{ASSUMPTION}}. Each corrected run's daily rain for Hawaiʻi water years `r min(hr_wys)`-`r max(hr_wys)` goes through the model as it is, so each future carries the model's own changes in rain days, dry spells and timing. As a check, observed rain on the same days goes through the same model (`r fref("need")`, dashed line).
 
 **Strengths.**
 
-- The physical model simulates the trade-wind inversion and windward-leeward contrast that control rain at the Summit (Zhang et al., 2016). After correction, its longest dry-season dry spell and heavy-rain days are `r num(hr_bias[m == "cdd_dry"]$ratio, 2)` and `r num(hr_bias[m == "heavy"]$ratio, 2)` times observed at the Summit (`r tref("hrcm")`).
+- The physical model simulates the trade-wind inversion and windward-leeward contrast that control rain at the catchment (Zhang et al., 2016). After correction, its longest dry-season dry spell and heavy-rain days are `r num(hr_bias[m == "cdd_dry"]$ratio, 2)` and `r num(hr_bias[m == "heavy"]$ratio, 2)` times observed at the catchment (`r tref("hrcm")`).
 - The tank model runs on the model's own simulated days, so each future's changes in rain days, dry spells, monthly timing and storms reach the tanks, not only its change in totals.
 - The three runs replay the same weather years, so each future is compared with the present day year by year, with the year-to-year weather held the same.
 - Everything is computed from public data and reruns from this file; assumptions are parameters.
